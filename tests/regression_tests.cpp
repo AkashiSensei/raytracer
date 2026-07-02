@@ -323,6 +323,112 @@ void test_environment_solid_and_gradient_backgrounds() {
           "gradient environment should vary with ray direction");
 }
 
+void test_render_scene_reports_partial_updates() {
+    {
+        std::ofstream out("/tmp/rt_partial_updates.json");
+        out << "{"
+            << "\"image\":{\"width\":8,\"height\":4,\"samples\":1,\"max_depth\":2},"
+            << "\"environment\":{\"type\":\"solid\",\"color\":[0.1,0.2,0.3]},"
+            << "\"objects\":[]"
+            << "}";
+    }
+
+    Scene scene;
+    load_scene("/tmp/rt_partial_updates.json", scene);
+
+    RenderOptions options;
+    options.threads = 1;
+    options.partial_update_interval = 2;
+
+    int partial_count = 0;
+    int status_count = 0;
+    long long last_pixels_done = 0;
+    double last_progress = 0.0;
+    RenderCallbacks callbacks;
+    callbacks.status = [&](const RenderProgressInfo& info) {
+        status_count += 1;
+        last_pixels_done = info.pixels_done;
+        check(info.schedule == RenderSchedule::Rows, "row schedule status should identify row scheduling");
+        check(info.pixels_total == static_cast<long long>(scene.width) * static_cast<long long>(scene.height),
+              "row schedule status should report total pixels");
+        check(info.elapsed_seconds >= 0.0, "row schedule status should report elapsed seconds");
+    };
+    callbacks.partial = [&](const RenderOutput& partial, double progress) {
+        partial_count += 1;
+        last_progress = progress;
+        check(partial.width == scene.width && partial.height == scene.height,
+              "partial render output should preserve image dimensions");
+        check(partial.pixels.size() == static_cast<size_t>(scene.width) * static_cast<size_t>(scene.height),
+              "partial render output should preserve pixel buffer size");
+        check(progress > 0.0 && progress <= 1.0,
+              "partial render progress should be normalized");
+    };
+
+    RenderOutput output = render_scene(scene, options, callbacks);
+    check(!output.cancelled, "partial update test render should complete");
+    check(status_count > 0, "render_scene should emit row schedule status updates");
+    check(last_pixels_done == static_cast<long long>(scene.width) * static_cast<long long>(scene.height),
+          "final row schedule status should report all pixels complete");
+    check(partial_count >= 2, "render_scene should emit partial updates at configured row intervals");
+    check(status_count >= partial_count, "row schedule should emit status for each partial update");
+    check(near(last_progress, 1.0), "final partial update should report full progress");
+}
+
+void test_render_scene_sample_pass_schedule_reports_accumulated_samples() {
+    {
+        std::ofstream out("/tmp/rt_sample_pass_updates.json");
+        out << "{"
+            << "\"image\":{\"width\":4,\"height\":3,\"samples\":4,\"max_depth\":2},"
+            << "\"environment\":{\"type\":\"solid\",\"color\":[0.2,0.3,0.4]},"
+            << "\"objects\":[]"
+            << "}";
+    }
+
+    Scene scene;
+    load_scene("/tmp/rt_sample_pass_updates.json", scene);
+
+    RenderOptions options;
+    options.threads = 1;
+    options.partial_update_interval = 2;
+    options.sample_pass_batch = 2;
+    options.schedule = RenderSchedule::SamplePasses;
+
+    int partial_count = 0;
+    int status_count = 0;
+    int last_status_samples = 0;
+    int last_partial_samples = 0;
+    RenderCallbacks callbacks;
+    callbacks.status = [&](const RenderProgressInfo& info) {
+        status_count += 1;
+        last_status_samples = info.samples_done;
+        check(info.schedule == RenderSchedule::SamplePasses,
+              "sample-pass status should identify sample-pass scheduling");
+        check(info.samples_total == scene.samples,
+              "sample-pass status should report total samples");
+        check(info.elapsed_seconds >= 0.0,
+              "sample-pass status should report elapsed seconds");
+    };
+    callbacks.partial = [&](const RenderOutput& partial, double progress) {
+        partial_count += 1;
+        last_partial_samples = partial.samples;
+        check(partial.width == scene.width && partial.height == scene.height,
+              "sample-pass partial output should preserve image dimensions");
+        check(partial.samples == 2 || partial.samples == 4,
+              "sample-pass partial output should report accumulated sample count");
+        check(progress > 0.0 && progress <= 1.0,
+              "sample-pass partial progress should be normalized");
+    };
+
+    RenderOutput output = render_scene(scene, options, callbacks);
+    check(!output.cancelled, "sample-pass schedule render should complete");
+    check(output.samples == scene.samples, "final sample-pass output should keep requested sample count");
+    check(status_count > 0, "sample-pass schedule should emit status updates");
+    check(last_status_samples == scene.samples, "final sample-pass status should report all samples complete");
+    check(partial_count == 2, "sample-pass schedule should emit partial updates at sample intervals");
+    check(status_count >= partial_count, "sample-pass schedule should emit status for each partial update");
+    check(last_partial_samples == scene.samples, "final sample-pass partial should use final sample count");
+}
+
 void test_extended_light_types_parse() {
     JsonValue rect;
     rect.type = JsonValue::Object;
@@ -333,6 +439,8 @@ void test_extended_light_types_parse() {
     Light rect_light = parse_light(rect);
     check(rect_light.type == LightType::Rect, "rect light should parse as rectangular area light");
     check(near(rect_light.area(), 2.0), "rect light area should come from u cross v");
+    check(!rect_light.visible_camera && rect_light.visible_specular,
+          "area lights should default to camera-hidden and specular-visible");
 
     JsonValue sphere;
     sphere.type = JsonValue::Object;
@@ -381,6 +489,48 @@ void test_extended_light_sampling_outputs_radiance() {
           "spot light should reject points outside its cone");
 }
 
+void test_analytic_area_light_visibility_for_camera_and_specular_rays() {
+    {
+        std::ofstream out("/tmp/rt_area_light_visibility.json");
+        out << "{"
+            << "\"image\":{\"width\":16,\"height\":16,\"samples\":1},"
+            << "\"background\":{\"type\":\"solid\",\"color\":[0,0,0]},"
+            << "\"lighting\":{\"ambient\":[0,0,0]},"
+            << "\"camera\":{\"lookfrom\":[0,0,0],\"lookat\":[0,0,-1],\"vfov\":60},"
+            << "\"lights\":[{\"type\":\"rect\",\"position\":[0,0,-2],\"direction\":[0,0,1],"
+            << "\"u\":[2,0,0],\"v\":[0,2,0],\"color\":[1,0.5,0.25],\"intensity\":3}],"
+            << "\"objects\":[]"
+            << "}";
+    }
+    Scene hidden_scene;
+    load_scene("/tmp/rt_area_light_visibility.json", hidden_scene);
+    RenderOptions options;
+    Ray ray(Point3(0, 0, 0), Vec3(0, 0, -1));
+    Color camera_hit = ray_color(ray, hidden_scene, 4, options, infinity, false, RayPathType::Camera);
+    check(near_vec(camera_hit, Color(0, 0, 0), 1e-9),
+          "area light should be hidden from camera rays by default");
+    Color specular_hit = ray_color(ray, hidden_scene, 4, options, infinity, false, RayPathType::Specular);
+    check(near_vec(specular_hit, Color(3, 1.5, 0.75), 1e-9),
+          "area light should be visible to specular rays by default");
+
+    {
+        std::ofstream out("/tmp/rt_area_light_camera_visible.json");
+        out << "{"
+            << "\"image\":{\"width\":16,\"height\":16,\"samples\":1},"
+            << "\"background\":{\"type\":\"solid\",\"color\":[0,0,0]},"
+            << "\"camera\":{\"lookfrom\":[0,0,0],\"lookat\":[0,0,-1],\"vfov\":60},"
+            << "\"lights\":[{\"type\":\"rect\",\"position\":[0,0,-2],\"direction\":[0,0,1],"
+            << "\"u\":[2,0,0],\"v\":[0,2,0],\"intensity\":2,\"visible_camera\":true}],"
+            << "\"objects\":[]"
+            << "}";
+    }
+    Scene visible_scene;
+    load_scene("/tmp/rt_area_light_camera_visible.json", visible_scene);
+    Color visible_camera_hit = ray_color(ray, visible_scene, 4, options, infinity, false, RayPathType::Camera);
+    check(near_vec(visible_camera_hit, Color(2, 2, 2), 1e-9),
+          "visible_camera=true should make analytic area lights visible to camera rays");
+}
+
 void test_camera_focal_length_orbit_and_framing_fields() {
     {
         std::ofstream out("/tmp/rt_camera_focal.json");
@@ -394,6 +544,23 @@ void test_camera_focal_length_orbit_and_framing_fields() {
     load_scene("/tmp/rt_camera_focal.json", focal_scene);
     check(near(focal_scene.camera->vfov_degrees(), 53.13010235415598, 1e-6),
           "camera focal_length/sensor_height should derive vertical FOV");
+
+    {
+        std::ofstream out("/tmp/rt_camera_frame.json");
+        out << "{"
+            << "\"image\":{\"width\":100,\"height\":100},"
+            << "\"camera\":{"
+            << "\"lookfrom\":[0,0,0],\"lookat\":[0,0,-1],\"vfov\":90,"
+            << "\"frame\":{\"lower_left\":[-2,-1,-1],\"horizontal\":[4,0,0],\"vertical\":[0,2,0]}"
+            << "},"
+            << "\"objects\":[]"
+            << "}";
+    }
+    Scene frame_scene;
+    load_scene("/tmp/rt_camera_frame.json", frame_scene);
+    Ray right_edge = frame_scene.camera->get_ray(1.0, 0.5);
+    check(near_vec(right_edge.direction, Vec3(2, 0, -1), 1e-9),
+          "camera frame should override centered vfov projection for Blender framing");
 
     {
         std::ofstream out("/tmp/rt_camera_orbit.json");
@@ -691,6 +858,297 @@ void test_transformed_texture_applies_uv_scale_offset() {
     Color c = tex.value(0.25, 0.5, Point3(0, 0, 0));
     // u' = 0.25 * 2 + 0.5 = 1.0; v' = 0.5 * 1 + 0 = 0.5; solid ignores UV so color unchanged
     check(near_vec(c, Color(0.4, 0.6, 0.8)), "TransformedTexture should pass through to wrapped texture");
+
+    auto checker = std::make_shared<CheckerTexture>(Color(1, 1, 1), Color(0, 0, 0), 1.0);
+    TransformedTexture rotated(checker, Vec2(1.0, 1.0), Vec2(0.5, 0.0), 90.0);
+    check(near_vec(rotated.value(0.25, 0.25, Point3()), Color(1, 1, 1), 1e-6),
+          "TransformedTexture should apply offset after rotation");
+}
+
+void test_checker_texture_json_scale_and_offset() {
+    JsonValue checker = parse_json(
+        "{\"type\":\"checker\",\"color1\":[1,1,1],\"color2\":[0,0,0],"
+        "\"scale\":2,\"uv_scale\":[1,1],\"uv_offset\":[0.25,0]}");
+    auto tex = parse_texture_json(checker, std::filesystem::current_path());
+    check(near_vec(tex->value(0.0, 0.0, Point3()), Color(1, 1, 1)),
+          "checker texture should sample color1 in the first transformed cell");
+    check(near_vec(tex->value(0.25, 0.0, Point3()), Color(0, 0, 0)),
+          "checker texture uv_offset and scale should move sampling into the adjacent cell");
+
+    JsonValue rotated_checker = parse_json(
+        "{\"type\":\"checker\",\"color1\":[1,1,1],\"color2\":[0,0,0],"
+        "\"scale\":1,\"uv_scale\":[1,1],\"uv_offset\":[0.5,0],\"uv_rotation\":90}");
+    auto rotated = parse_texture_json(rotated_checker, std::filesystem::current_path());
+    check(near_vec(rotated->value(0.25, 0.25, Point3()), Color(1, 1, 1), 1e-6),
+          "checker texture should apply uv_offset after uv_rotation");
+
+    std::ofstream out("/tmp/rt_checker_material.json");
+    out << "{"
+        << "\"image\":{\"width\":8,\"height\":8,\"samples\":1},"
+        << "\"camera\":{\"lookfrom\":[0,0,2],\"lookat\":[0,0,0],\"vfov\":60},"
+        << "\"objects\":[{\"type\":\"sphere\",\"center\":[0,0,0],\"radius\":1,"
+        << "\"material\":{\"type\":\"pbr\",\"albedo\":{\"type\":\"checker\","
+        << "\"color1\":[0.9,0.9,0.9],\"color2\":[0.1,0.1,0.1],\"scale\":4},"
+        << "\"metallic\":0,\"roughness\":0.5}}]"
+        << "}";
+    out.close();
+    Scene scene;
+    load_scene("/tmp/rt_checker_material.json", scene);
+    HitRecord rec;
+    rec.u = 0.1;
+    rec.v = 0.1;
+    rec.p = Point3();
+    check(near_vec(scene.materials[0]->base_color(rec), Color(0.9, 0.9, 0.9), 1e-6),
+          "PBR albedo should accept a checker texture object");
+}
+
+void test_image_texture_json_accepts_inline_base64_payload() {
+    JsonValue image = parse_json(
+        "{\"type\":\"image\",\"mime_type\":\"image/png\","
+        "\"data_base64\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==\"}");
+    auto tex = parse_texture_json(image, std::filesystem::current_path());
+    Color c = tex->value(0.0, 0.0, Point3());
+    check(finite_vec(c) && c.x >= 0.0 && c.x <= 1.0 && c.y >= 0.0 && c.y <= 1.0 && c.z >= 0.0 && c.z <= 1.0,
+          "image texture JSON with data_base64 should decode and sample a finite color");
+}
+
+void test_image_texture_json_accepts_uv_mapping_fields() {
+    std::string checker_path = (std::filesystem::current_path() / "textures/checkerboard.png").string();
+    JsonValue image = parse_json(
+        "{\"type\":\"image\",\"path\":\"textures/checkerboard.png\","
+        "\"uv_scale\":[5,5],\"uv_offset\":[0,0],\"uv_rotation\":0}");
+    auto tex = parse_texture_json(image, std::filesystem::current_path());
+    Color c = tex->value(0.1, 0.1, Point3());
+    check(finite_vec(c) && c.x >= 0.0 && c.x <= 1.0 && c.y >= 0.0 && c.y <= 1.0 && c.z >= 0.0 && c.z <= 1.0,
+          "image texture JSON with UV mapping fields should load and sample a finite color");
+
+    std::ofstream out("/tmp/rt_image_texture_mapping.json");
+    out << "{"
+        << "\"image\":{\"width\":8,\"height\":8,\"samples\":1},"
+        << "\"camera\":{\"lookfrom\":[0,0,2],\"lookat\":[0,0,0],\"vfov\":60},"
+        << "\"objects\":[{\"type\":\"sphere\",\"center\":[0,0,0],\"radius\":1,"
+        << "\"material\":{\"type\":\"pbr\",\"albedo\":{\"type\":\"image\","
+        << "\"path\":\"" << checker_path << "\",\"uv_scale\":[5,5]},"
+        << "\"metallic\":0,\"roughness\":0.5}}]"
+        << "}";
+    out.close();
+    Scene scene;
+    load_scene("/tmp/rt_image_texture_mapping.json", scene);
+    HitRecord rec;
+    rec.u = 0.12;
+    rec.v = 0.34;
+    rec.p = Point3();
+    Color base = scene.materials[0]->base_color(rec);
+    check(finite_vec(base), "PBR albedo should accept an image texture object with UV mapping");
+}
+
+void test_image_texture_linear_interpolation() {
+    ImageTexture tex;
+    tex.width = 2;
+    tex.height = 1;
+    tex.pixels = {Color(0, 0, 0), Color(1, 1, 1)};
+    tex.interpolation = ImageTexture::Interpolation::Linear;
+    Color middle = tex.value(0.5, 0.5, Point3());
+    check(near_vec(middle, Color(0.5, 0.5, 0.5), 1e-6),
+          "ImageTexture linear interpolation should blend neighboring texels");
+}
+
+void test_image_texture_srgb_decode() {
+    ImageTexture tex;
+    tex.width = 1;
+    tex.height = 1;
+    tex.pixels = {Color(0.5, 0.5, 0.5)};
+    tex.decode_srgb = true;
+    Color linear = tex.value(0.5, 0.5, Point3());
+    check(near(linear.x, 0.21404114048223255, 1e-6) &&
+          near(linear.y, 0.21404114048223255, 1e-6) &&
+          near(linear.z, 0.21404114048223255, 1e-6),
+          "ImageTexture should decode sRGB texels to linear when requested");
+}
+
+void test_image_texture_extension_modes() {
+    ImageTexture tex;
+    tex.width = 2;
+    tex.height = 1;
+    tex.pixels = {Color(0, 0, 0), Color(1, 1, 1)};
+
+    tex.extension = ImageTexture::Extension::Extend;
+    check(near_vec(tex.value(1.25, 0.5, Point3()), Color(1, 1, 1), 1e-6),
+          "ImageTexture extend mode should clamp UVs to the texture edge");
+
+    tex.extension = ImageTexture::Extension::Clip;
+    check(near_vec(tex.value(1.25, 0.5, Point3()), Color(0, 0, 0), 1e-6),
+          "ImageTexture clip mode should return black outside 0..1 UVs");
+
+    tex.extension = ImageTexture::Extension::Mirror;
+    check(near_vec(tex.value(1.25, 0.5, Point3()), Color(1, 1, 1), 1e-6) &&
+          near_vec(tex.value(-0.25, 0.5, Point3()), Color(0, 0, 0), 1e-6),
+          "ImageTexture mirror mode should mirror-repeat UVs");
+
+    tex.interpolation = ImageTexture::Interpolation::Linear;
+    tex.extension = ImageTexture::Extension::Extend;
+    check(near_vec(tex.value(0.0, 0.5, Point3()), Color(0, 0, 0), 1e-6) &&
+          near_vec(tex.value(1.0, 0.5, Point3()), Color(1, 1, 1), 1e-6),
+          "ImageTexture linear extend mode should clamp edge samples instead of wrapping");
+
+    tex.extension = ImageTexture::Extension::Clip;
+    check(near_vec(tex.value(0.0, 0.5, Point3()), Color(0, 0, 0), 1e-6) &&
+          near_vec(tex.value(1.0, 0.5, Point3()), Color(1, 1, 1), 1e-6),
+          "ImageTexture linear clip mode should clamp in-range edge samples instead of wrapping");
+}
+
+void test_color_ramp_texture_json_wraps_source_texture() {
+    JsonValue ramp = parse_json(
+        "{\"type\":\"color_ramp\",\"source\":{\"type\":\"checker\",\"color1\":[0,0,0],"
+        "\"color2\":[1,1,1],\"scale\":2},\"stops\":["
+        "{\"position\":0,\"color\":[1,0,0]},"
+        "{\"position\":1,\"color\":[0,0,1]}]}");
+    auto tex = parse_texture_json(ramp, std::filesystem::current_path());
+    check(near_vec(tex->value(0.1, 0.1, Point3()), Color(1, 0, 0), 1e-6),
+          "ColorRampTexture JSON should map dark source values to the first ramp color");
+    check(near_vec(tex->value(0.6, 0.1, Point3()), Color(0, 0, 1), 1e-6),
+          "ColorRampTexture JSON should map bright source values to the last ramp color");
+}
+
+void test_color_ramp_texture_interpolation_modes() {
+    JsonValue constant = parse_json(
+        "{\"type\":\"color_ramp\",\"interpolation\":\"constant\","
+        "\"source\":{\"type\":\"solid\",\"color\":[0.5,0.5,0.5]},\"stops\":["
+        "{\"position\":0,\"color\":[1,0,0]},"
+        "{\"position\":1,\"color\":[0,0,1]}]}");
+    auto constant_tex = parse_texture_json(constant, std::filesystem::current_path());
+    check(near_vec(constant_tex->value(0.0, 0.0, Point3()), Color(1, 0, 0), 1e-6),
+          "ColorRampTexture constant interpolation should hold the previous stop color");
+
+    JsonValue ease = parse_json(
+        "{\"type\":\"color_ramp\",\"interpolation\":\"ease\","
+        "\"source\":{\"type\":\"solid\",\"color\":[0.25,0.25,0.25]},\"stops\":["
+        "{\"position\":0,\"color\":[0,0,0]},"
+        "{\"position\":1,\"color\":[1,1,1]}]}");
+    auto ease_tex = parse_texture_json(ease, std::filesystem::current_path());
+    check(near_vec(ease_tex->value(0.0, 0.0, Point3()), Color(0.15625, 0.15625, 0.15625), 1e-6),
+          "ColorRampTexture ease interpolation should smooth the ramp factor");
+}
+
+void test_math_and_mix_texture_json_nodes() {
+    JsonValue math = parse_json(
+        "{\"type\":\"math\",\"operation\":\"multiply\","
+        "\"a\":{\"type\":\"checker\",\"color1\":[0,0,0],\"color2\":[1,1,1],\"scale\":2},"
+        "\"b\":{\"type\":\"solid\",\"color\":[0.5,0.5,0.5]}}");
+    auto math_tex = parse_texture_json(math, std::filesystem::current_path());
+    check(near_vec(math_tex->value(0.1, 0.1, Point3()), Color(0, 0, 0), 1e-6) &&
+          near_vec(math_tex->value(0.6, 0.1, Point3()), Color(0.5, 0.5, 0.5), 1e-6),
+          "MathTexture JSON should preserve dynamic scalar texture inputs");
+
+    JsonValue mix = parse_json(
+        "{\"type\":\"mix\",\"factor\":{\"type\":\"solid\",\"color\":[0.25,0.25,0.25]},"
+        "\"color1\":{\"type\":\"solid\",\"color\":[1,0,0]},"
+        "\"color2\":{\"type\":\"solid\",\"color\":[0,0,1]}}");
+    auto mix_tex = parse_texture_json(mix, std::filesystem::current_path());
+    check(near_vec(mix_tex->value(0.0, 0.0, Point3()), Color(0.75, 0.0, 0.25), 1e-6),
+          "MixTexture JSON should linearly blend two color textures");
+
+    JsonValue clamped = parse_json(
+        "{\"type\":\"math\",\"operation\":\"add\",\"clamp\":true,"
+        "\"a\":{\"type\":\"solid\",\"color\":[0.75,0.75,0.75]},"
+        "\"b\":{\"type\":\"solid\",\"color\":[0.75,0.75,0.75]}}");
+    auto clamped_tex = parse_texture_json(clamped, std::filesystem::current_path());
+    check(near_vec(clamped_tex->value(0.0, 0.0, Point3()), Color(1, 1, 1), 1e-6),
+          "MathTexture JSON should clamp scalar results when requested");
+
+    JsonValue material = parse_json(
+        "{\"type\":\"pbr\",\"albedo\":[0.8,0.8,0.8],\"metallic\":0,"
+        "\"roughness\":{\"type\":\"mix\","
+        "\"factor\":{\"type\":\"solid\",\"color\":[0.25,0.25,0.25]},"
+        "\"color1\":{\"type\":\"solid\",\"color\":[0.2,0.2,0.2]},"
+        "\"color2\":{\"type\":\"solid\",\"color\":[0.6,0.6,0.6]}}}");
+    Scene scene;
+    Material* mat = parse_material(material, scene, std::filesystem::current_path());
+    auto* pbr = dynamic_cast<PBR*>(mat);
+    check(pbr != nullptr &&
+          near(pbr->roughness->value(0.0, 0.0, Point3()).x, 0.3, 1e-6),
+          "PBR scalar fields should accept MixTexture JSON nodes");
+}
+
+void test_noise_texture_json_is_deterministic_and_transformable() {
+    JsonValue noise = parse_json(
+        "{\"type\":\"noise\",\"scale\":6,\"detail\":4,\"roughness\":0.55,\"distortion\":0.25}");
+    auto tex = parse_texture_json(noise, std::filesystem::current_path());
+    Color a = tex->value(0.17, 0.29, Point3());
+    Color b = tex->value(0.17, 0.29, Point3());
+    check(near_vec(a, b, 1e-12) &&
+          a.x >= 0.0 && a.x <= 1.0 &&
+          a.y >= 0.0 && a.y <= 1.0 &&
+          a.z >= 0.0 && a.z <= 1.0,
+          "NoiseTexture JSON should be deterministic and normalized");
+
+    JsonValue transformed = parse_json(
+        "{\"type\":\"noise\",\"scale\":6,\"detail\":4,\"uv_offset\":[0.25,0.0]}");
+    auto moved = parse_texture_json(transformed, std::filesystem::current_path());
+    Color c = moved->value(0.17, 0.29, Point3());
+    check(!near_vec(a, c, 1e-6),
+          "NoiseTexture JSON should honor UV transform wrappers");
+}
+
+void test_invert_and_map_range_texture_json_nodes() {
+    JsonValue invert = parse_json(
+        "{\"type\":\"invert\",\"factor\":{\"type\":\"solid\",\"color\":[1,1,1]},"
+        "\"color\":{\"type\":\"checker\",\"color1\":[0.2,0.2,0.2],"
+        "\"color2\":[0.8,0.8,0.8],\"scale\":2}}");
+    auto invert_tex = parse_texture_json(invert, std::filesystem::current_path());
+    check(near_vec(invert_tex->value(0.1, 0.1, Point3()), Color(0.8, 0.8, 0.8), 1e-6) &&
+          near_vec(invert_tex->value(0.6, 0.1, Point3()), Color(0.2, 0.2, 0.2), 1e-6),
+          "InvertTexture JSON should dynamically invert wrapped texture colors");
+
+    JsonValue mapped = parse_json(
+        "{\"type\":\"map_range\",\"from_min\":0,\"from_max\":1,\"to_min\":0.2,\"to_max\":0.6,"
+        "\"value\":{\"type\":\"checker\",\"color1\":[0,0,0],\"color2\":[1,1,1],\"scale\":2}}");
+    auto mapped_tex = parse_texture_json(mapped, std::filesystem::current_path());
+    check(near_vec(mapped_tex->value(0.1, 0.1, Point3()), Color(0.2, 0.2, 0.2), 1e-6) &&
+          near_vec(mapped_tex->value(0.6, 0.1, Point3()), Color(0.6, 0.6, 0.6), 1e-6),
+          "MapRangeTexture JSON should dynamically remap scalar texture values");
+}
+
+void test_texture_export_metadata_is_ignored_by_scene_parser() {
+    JsonValue material = parse_json(
+        "{\"type\":\"pbr\",\"unsupported_textures\":[\"MUSGRAVE\"],"
+        "\"albedo\":{\"type\":\"checker\",\"coord\":\"generated\","
+        "\"color1\":[1,1,1],\"color2\":[0,0,0],\"scale\":2},"
+        "\"metallic\":0,\"roughness\":0.5}");
+    Scene scene;
+    Material* mat = parse_material(material, scene, std::filesystem::current_path());
+    auto* pbr = dynamic_cast<PBR*>(mat);
+    check(pbr != nullptr, "PBR material should parse with texture export metadata present");
+    if (pbr == nullptr) return;
+    HitRecord rec;
+    rec.u = 0.1;
+    rec.v = 0.1;
+    rec.p = Point3();
+    check(near_vec(pbr->base_color(rec), Color(1, 1, 1), 1e-6),
+          "texture coord metadata should not alter renderer-side texture sampling");
+}
+
+void test_pbr_scalar_fields_accept_texture_objects() {
+    JsonValue material = parse_json(
+        "{\"type\":\"pbr\",\"albedo\":[0.8,0.8,0.8],"
+        "\"metallic\":{\"type\":\"checker\",\"color1\":[0,0,0],\"color2\":[1,1,1],\"scale\":2},"
+        "\"roughness\":{\"type\":\"color_ramp\",\"source\":{\"type\":\"checker\","
+        "\"color1\":[0,0,0],\"color2\":[1,1,1],\"scale\":2},\"stops\":["
+        "{\"position\":0,\"color\":[0.25,0,0]},"
+        "{\"position\":1,\"color\":[0.75,0,0]}]}}");
+
+    Scene scene;
+    Material* mat = parse_material(material, scene, std::filesystem::current_path());
+    auto* pbr = dynamic_cast<PBR*>(mat);
+    check(pbr != nullptr, "PBR material should parse for scalar texture regression");
+    if (pbr == nullptr) return;
+
+    check(near(pbr->metallic->value(0.1, 0.1, Point3()).x, 0.0, 1e-6) &&
+          near(pbr->metallic->value(0.6, 0.1, Point3()).x, 1.0, 1e-6),
+          "PBR metallic should accept a checker texture object");
+    check(near(pbr->roughness->value(0.1, 0.1, Point3()).x, 0.25, 1e-6) &&
+          near(pbr->roughness->value(0.6, 0.1, Point3()).x, 0.75, 1e-6),
+          "PBR roughness should accept a color-ramp texture object");
 }
 
 void test_random_seed_repeats_sequence() {
@@ -933,8 +1391,11 @@ int main() {
     test_display_color_exposure_and_tone_mapping();
     test_output_format_detection();
     test_environment_solid_and_gradient_backgrounds();
+    test_render_scene_reports_partial_updates();
+    test_render_scene_sample_pass_schedule_reports_accumulated_samples();
     test_extended_light_types_parse();
     test_extended_light_sampling_outputs_radiance();
+    test_analytic_area_light_visibility_for_camera_and_specular_rays();
     test_camera_focal_length_orbit_and_framing_fields();
     test_scene_preset_and_render_block_are_accepted();
     test_firefly_clamp_preserves_hue_by_scaling();
@@ -947,6 +1408,19 @@ int main() {
     test_dielectric_partial_transmission_factor_stores();
     test_material_alpha_mask_interface();
     test_transformed_texture_applies_uv_scale_offset();
+    test_checker_texture_json_scale_and_offset();
+    test_image_texture_json_accepts_inline_base64_payload();
+    test_image_texture_json_accepts_uv_mapping_fields();
+    test_image_texture_linear_interpolation();
+    test_image_texture_srgb_decode();
+    test_image_texture_extension_modes();
+    test_color_ramp_texture_json_wraps_source_texture();
+    test_color_ramp_texture_interpolation_modes();
+    test_math_and_mix_texture_json_nodes();
+    test_noise_texture_json_is_deterministic_and_transformable();
+    test_invert_and_map_range_texture_json_nodes();
+    test_texture_export_metadata_is_ignored_by_scene_parser();
+    test_pbr_scalar_fields_accept_texture_objects();
     test_json_dielectric_accepts_volume_attenuation();
     test_random_seed_repeats_sequence();
     test_random_double_stays_in_unit_interval();

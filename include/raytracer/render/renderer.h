@@ -9,11 +9,18 @@
 #include "raytracer/scene/scene.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
+
+enum class RenderSchedule {
+    Rows,
+    SamplePasses
+};
 
 struct RenderOptions {
     bool direct_only = false;
@@ -21,11 +28,9 @@ struct RenderOptions {
     bool stats = false;
     std::string stats_format = "text";
     int threads = 0;
-};
-
-struct RenderCallbacks {
-    std::function<void(double)> progress;
-    std::function<bool()> should_cancel;
+    int partial_update_interval = 0;
+    int sample_pass_batch = 16;
+    RenderSchedule schedule = RenderSchedule::Rows;
 };
 
 struct RenderOutput {
@@ -35,6 +40,142 @@ struct RenderOutput {
     bool cancelled = false;
     std::vector<Color> pixels;
 };
+
+struct RenderProgressInfo {
+    RenderSchedule schedule = RenderSchedule::Rows;
+    double progress = 0.0;
+    int samples_done = 0;
+    int samples_total = 0;
+    int rows_done = 0;
+    int rows_total = 0;
+    long long pixels_done = 0;
+    long long pixels_total = 0;
+    double elapsed_seconds = 0.0;
+    double remaining_seconds = -1.0;
+};
+
+struct RenderCallbacks {
+    std::function<void(double)> progress;
+    std::function<void(const RenderProgressInfo&)> status;
+    std::function<void(const RenderOutput&, double)> partial;
+    std::function<bool()> should_cancel;
+};
+
+inline const char* render_schedule_name(RenderSchedule schedule) {
+    return schedule == RenderSchedule::SamplePasses ? "sample_passes" : "rows";
+}
+
+enum class RayPathType {
+    Camera,
+    Specular,
+    Diffuse
+};
+
+struct VisibleLightHit {
+    double t = infinity;
+    Color emission = Color(0, 0, 0);
+};
+
+inline bool light_visible_to_path(const Light& light, RayPathType path_type) {
+    if (path_type == RayPathType::Camera) return light.visible_camera;
+    if (path_type == RayPathType::Specular) return light.visible_specular;
+    return light.visible_diffuse;
+}
+
+inline bool hit_rect_light(const Light& light, const Ray& ray, double t_min, double t_max, double& t_out) {
+    Vec3 plane_normal = cross(light.u, light.v);
+    if (plane_normal.length_squared() <= 1e-12) return false;
+    plane_normal = plane_normal.normalized();
+
+    double denom = dot(plane_normal, ray.direction);
+    if (std::fabs(denom) <= 1e-10) return false;
+
+    double t = dot(light.position - ray.origin, plane_normal) / denom;
+    if (t <= t_min || t >= t_max) return false;
+
+    Vec3 view_from_light = -ray.direction.normalized();
+    if (dot(safe_normalized(light.direction, plane_normal), view_from_light) <= 0.0) return false;
+
+    Point3 p = ray.at(t);
+    Vec3 rel = p - light.position;
+    double u_len2 = light.u.length_squared();
+    double v_len2 = light.v.length_squared();
+    if (u_len2 <= 1e-12 || v_len2 <= 1e-12) return false;
+    double u_coord = dot(rel, light.u) / u_len2;
+    double v_coord = dot(rel, light.v) / v_len2;
+    if (std::fabs(u_coord) > 0.5 || std::fabs(v_coord) > 0.5) return false;
+
+    t_out = t;
+    return true;
+}
+
+inline bool hit_disk_light(const Light& light, const Ray& ray, double t_min, double t_max, double& t_out) {
+    Vec3 plane_normal = safe_normalized(light.direction, Vec3(0, -1, 0));
+    double denom = dot(plane_normal, ray.direction);
+    if (std::fabs(denom) <= 1e-10) return false;
+
+    double t = dot(light.position - ray.origin, plane_normal) / denom;
+    if (t <= t_min || t >= t_max) return false;
+
+    Vec3 view_from_light = -ray.direction.normalized();
+    if (dot(plane_normal, view_from_light) <= 0.0) return false;
+
+    Vec3 rel = ray.at(t) - light.position;
+    double along_normal = dot(rel, plane_normal);
+    Vec3 radial = rel - along_normal * plane_normal;
+    if (radial.length_squared() > light.radius * light.radius) return false;
+
+    t_out = t;
+    return true;
+}
+
+inline bool hit_sphere_light(const Light& light, const Ray& ray, double t_min, double t_max, double& t_out) {
+    Vec3 oc = ray.origin - light.position;
+    double a = ray.direction.length_squared();
+    double half_b = dot(oc, ray.direction);
+    double c = oc.length_squared() - light.radius * light.radius;
+    double discriminant = half_b * half_b - a * c;
+    if (discriminant < 0) return false;
+    double sqrtd = std::sqrt(discriminant);
+
+    double root = (-half_b - sqrtd) / a;
+    if (root <= t_min || root >= t_max) {
+        root = (-half_b + sqrtd) / a;
+        if (root <= t_min || root >= t_max) return false;
+    }
+
+    t_out = root;
+    return true;
+}
+
+inline bool hit_visible_analytic_light(const Scene& scene,
+                                       const Ray& ray,
+                                       RayPathType path_type,
+                                       double t_max,
+                                       VisibleLightHit& hit) {
+    bool found = false;
+    double closest = t_max;
+    for (const Light& light : scene.lights) {
+        if (!light_visible_to_path(light, path_type)) continue;
+
+        double t = infinity;
+        bool light_hit = false;
+        if (light.type == LightType::Rect) {
+            light_hit = hit_rect_light(light, ray, 0.001, closest, t);
+        } else if (light.type == LightType::Disk) {
+            light_hit = hit_disk_light(light, ray, 0.001, closest, t);
+        } else if (light.type == LightType::Sphere) {
+            light_hit = hit_sphere_light(light, ray, 0.001, closest, t);
+        }
+
+        if (!light_hit) continue;
+        closest = t;
+        hit.t = t;
+        hit.emission = light.color * light.intensity;
+        found = true;
+    }
+    return found;
+}
 
 inline bool is_shadowed(const Hittable& world, const Ray& shadow_ray, double max_t) {
     Ray ray = shadow_ray;
@@ -108,11 +249,19 @@ inline Color direct_delta_lights(const Ray& r_in, const HitRecord& rec, const Sc
 inline Color ray_color(const Ray& r, const Scene& scene, int depth,
                        const RenderOptions& options,
                        double prev_pdf,
-                       bool prev_brdf) {
+                       bool prev_brdf,
+                       RayPathType path_type = RayPathType::Camera) {
     if (depth <= 0) return Color(0, 0, 0);
 
     HitRecord rec;
-    if (!scene.world->hit(r, 0.001, infinity, rec)) {
+    bool hit_world = scene.world->hit(r, 0.001, infinity, rec);
+    double world_t = hit_world ? rec.t : infinity;
+    VisibleLightHit light_hit;
+    if (hit_visible_analytic_light(scene, r, path_type, world_t, light_hit)) {
+        return light_hit.emission;
+    }
+
+    if (!hit_world) {
         return scene_background(scene, r);
     }
 
@@ -142,7 +291,7 @@ inline Color ray_color(const Ray& r, const Scene& scene, int depth,
             // across alpha-mask cutouts (e.g. a leaf inside a glass vase).
             continue_ray.medium_color = r.medium_color;
             continue_ray.medium_attenuation_distance = r.medium_attenuation_distance;
-            return ray_color(continue_ray, scene, depth, options, prev_pdf, prev_brdf);
+            return ray_color(continue_ray, scene, depth, options, prev_pdf, prev_brdf, path_type);
         }
     }
 
@@ -171,7 +320,7 @@ inline Color ray_color(const Ray& r, const Scene& scene, int depth,
             if (random_double() > p) return emission;
         }
 
-        Color child = ray_color(scattered, scene, depth - 1, options, 1.0, true);
+        Color child = ray_color(scattered, scene, depth - 1, options, 1.0, true, RayPathType::Specular);
         if (rr_active) child = child / p;
         return emission + attenuation * child;
     }
@@ -216,11 +365,11 @@ inline Color ray_color(const Ray& r, const Scene& scene, int depth,
     Color f_val = rec.material->f(r, scattered, rec);
     if (brdf_pdf <= 0) {
         return emission + direct +
-               attenuation * ray_color(scattered, scene, depth - 1, options, 1.0, true);
+               attenuation * ray_color(scattered, scene, depth - 1, options, 1.0, true, RayPathType::Diffuse);
     }
 
     Color indirect = f_val * dot(rec.normal, scattered.direction) / brdf_pdf
-                   * ray_color(scattered, scene, depth - 1, options, brdf_pdf, true);
+                   * ray_color(scattered, scene, depth - 1, options, brdf_pdf, true, RayPathType::Diffuse);
 
     return emission + direct + indirect;
 }
@@ -245,11 +394,20 @@ inline RenderOutput render_scene(const Scene& scene,
     output.pixels.assign(static_cast<size_t>(scene.width) * static_cast<size_t>(scene.height),
                          Color(0, 0, 0));
 
+    auto render_start_time = std::chrono::steady_clock::now();
     int thread_count = resolve_thread_count(scene, options);
-    std::atomic<int> next_row{0};
-    std::atomic<int> rows_done{0};
-    std::atomic<int> last_pct{-1};
     std::atomic<bool> cancelled{false};
+    std::mutex output_mutex;
+    std::mutex partial_mutex;
+    std::mutex progress_mutex;
+    int last_status_done_units = -1;
+    int last_status_percent = -1;
+    auto last_status_time = render_start_time;
+    const auto progress_status_interval = std::chrono::seconds(3);
+    int partial_interval = options.partial_update_interval > 0
+        ? std::max(1, options.partial_update_interval)
+        : 0;
+    bool partial_enabled = callbacks.partial && partial_interval > 0;
 
     auto cancel_requested = [&]() {
         if (cancelled.load()) return true;
@@ -260,56 +418,214 @@ inline RenderOutput render_scene(const Scene& scene,
         return false;
     };
 
-    auto report_progress = [&](int done_rows) {
-        if (!callbacks.progress || scene.height <= 0) return;
-        int pct = 100 * done_rows / scene.height;
-        int previous = last_pct.load();
-        if ((pct % 5 == 0 || done_rows == scene.height) && pct != previous &&
-            last_pct.compare_exchange_strong(previous, pct)) {
-            callbacks.progress(double(done_rows) / double(scene.height));
+    auto make_progress_info = [&](int done_units, int total_units) {
+        RenderProgressInfo info;
+        info.schedule = options.schedule;
+        info.progress = total_units > 0 ? double(done_units) / double(total_units) : 0.0;
+        info.samples_total = scene.samples;
+        info.rows_total = scene.height;
+        info.pixels_total = static_cast<long long>(scene.width) * static_cast<long long>(scene.height);
+        if (options.schedule == RenderSchedule::SamplePasses) {
+            info.samples_done = std::min(done_units, scene.samples);
+            info.rows_done = scene.height;
+            info.pixels_done = info.pixels_total;
+        } else {
+            info.samples_done = scene.samples;
+            info.rows_done = std::min(done_units, scene.height);
+            info.pixels_done = static_cast<long long>(info.rows_done) * static_cast<long long>(scene.width);
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        info.elapsed_seconds = std::chrono::duration<double>(now - render_start_time).count();
+        if (info.progress > 1e-6 && info.progress < 1.0) {
+            info.remaining_seconds = info.elapsed_seconds * (1.0 - info.progress) / info.progress;
+        } else if (info.progress >= 1.0) {
+            info.remaining_seconds = 0.0;
+        }
+        return info;
+    };
+
+    auto report_progress_info = [&](const RenderProgressInfo& info, int done_units, bool force) {
+        if (!callbacks.progress && !callbacks.status) return;
+        int pct = std::max(0, std::min(100, static_cast<int>(info.progress * 100.0)));
+        bool should_report = false;
+        {
+            std::lock_guard<std::mutex> lock(progress_mutex);
+            auto now = std::chrono::steady_clock::now();
+            bool same_done_units = done_units == last_status_done_units;
+            bool percent_advanced = pct > last_status_percent;
+            bool interval_elapsed = now - last_status_time >= progress_status_interval;
+            bool complete = info.progress >= 1.0;
+            should_report = force || percent_advanced || interval_elapsed ||
+                (complete && !same_done_units);
+            if (should_report) {
+                last_status_done_units = done_units;
+                last_status_percent = pct;
+                last_status_time = now;
+            }
+        }
+        if (should_report) {
+            if (callbacks.progress) callbacks.progress(info.progress);
+            if (callbacks.status) callbacks.status(info);
         }
     };
 
-    auto render_worker = [&]() {
-        while (!cancel_requested()) {
-            int j = next_row.fetch_add(1);
-            if (j >= scene.height) break;
+    auto report_progress = [&](int done_units, int total_units, bool force) {
+        if (total_units <= 0) return;
+        RenderProgressInfo info = make_progress_info(done_units, total_units);
+        report_progress_info(info, done_units, force);
+    };
 
-            int sample_row = scene.height - 1 - j;
-            for (int i = 0; i < scene.width; i++) {
-                if (cancel_requested()) break;
-                Color col(0, 0, 0);
-                for (int s = 0; s < scene.samples; s++) {
-                    if ((s & 15) == 0 && cancel_requested()) break;
-                    double offset_x = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
-                    double offset_y = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
-                    double u = (i + offset_x) / std::max(1, scene.width - 1);
-                    double v = (sample_row + offset_y) / std::max(1, scene.height - 1);
-                    Color sample = ray_color(
-                        scene.camera->get_ray(u, v), scene, scene.max_depth, options, infinity, false);
-                    col += clamp_radiance(sample, scene.firefly_clamp);
+    auto report_partial = [&](double progress, int samples_done) {
+        std::lock_guard<std::mutex> partial_lock(partial_mutex);
+        RenderOutput snapshot;
+        {
+            std::lock_guard<std::mutex> output_lock(output_mutex);
+            snapshot = output;
+        }
+        snapshot.samples = std::max(1, samples_done);
+        callbacks.partial(snapshot, progress);
+    };
+
+    auto render_rows = [&]() {
+        std::atomic<int> next_row{0};
+        std::atomic<int> rows_done{0};
+
+        auto maybe_report_partial = [&](int done_rows) {
+            if (!partial_enabled || scene.height <= 0) return;
+            if (done_rows != scene.height && (done_rows % partial_interval) != 0) return;
+            report_partial(double(done_rows) / double(scene.height), scene.samples);
+        };
+
+        auto render_worker = [&]() {
+            while (!cancel_requested()) {
+                int j = next_row.fetch_add(1);
+                if (j >= scene.height) break;
+
+                int sample_row = scene.height - 1 - j;
+                std::vector<Color> row_pixels;
+                if (partial_enabled) {
+                    row_pixels.assign(static_cast<size_t>(scene.width), Color(0, 0, 0));
                 }
-                output.pixels[static_cast<size_t>(j) * static_cast<size_t>(scene.width) +
-                              static_cast<size_t>(i)] = col;
+                bool row_cancelled = false;
+                for (int i = 0; i < scene.width; i++) {
+                    if (cancel_requested()) {
+                        row_cancelled = true;
+                        break;
+                    }
+                    Color col(0, 0, 0);
+                    for (int s = 0; s < scene.samples; s++) {
+                        if ((s & 15) == 0 && cancel_requested()) {
+                            row_cancelled = true;
+                            break;
+                        }
+                        double offset_x = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
+                        double offset_y = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
+                        double u = (i + offset_x) / std::max(1, scene.width - 1);
+                        double v = (sample_row + offset_y) / std::max(1, scene.height - 1);
+                        Color sample = ray_color(
+                            scene.camera->get_ray(u, v), scene, scene.max_depth, options, infinity, false);
+                        col += clamp_radiance(sample, scene.firefly_clamp);
+                    }
+                    if (row_cancelled) break;
+                    if (partial_enabled) {
+                        row_pixels[static_cast<size_t>(i)] = col;
+                    } else {
+                        output.pixels[static_cast<size_t>(j) * static_cast<size_t>(scene.width) +
+                                      static_cast<size_t>(i)] = col;
+                    }
+                }
+
+                if (cancelled.load() || row_cancelled) break;
+                if (partial_enabled) {
+                    std::lock_guard<std::mutex> lock(output_mutex);
+                    std::copy(row_pixels.begin(),
+                              row_pixels.end(),
+                              output.pixels.begin() +
+                                  static_cast<size_t>(j) * static_cast<size_t>(scene.width));
+                }
+                int done = rows_done.fetch_add(1) + 1;
+                report_progress(done, scene.height, false);
+                maybe_report_partial(done);
+            }
+        };
+
+        std::vector<std::thread> workers;
+        workers.reserve(static_cast<size_t>(thread_count));
+        for (int t = 0; t < thread_count; t++) {
+            workers.emplace_back(render_worker);
+        }
+        for (std::thread& worker : workers) {
+            worker.join();
+        }
+    };
+
+    auto render_sample_passes = [&]() {
+        int sample_batch = std::max(1, options.sample_pass_batch);
+        int last_partial_samples = 0;
+        for (int sample_start = 0; sample_start < scene.samples && !cancel_requested();
+             sample_start += sample_batch) {
+            int samples_this_pass = std::min(sample_batch, scene.samples - sample_start);
+            std::atomic<int> next_row{0};
+
+            auto render_pass_worker = [&]() {
+                while (!cancel_requested()) {
+                    int j = next_row.fetch_add(1);
+                    if (j >= scene.height) break;
+
+                    int sample_row = scene.height - 1 - j;
+                    for (int i = 0; i < scene.width; i++) {
+                        if (cancel_requested()) break;
+                        Color col(0, 0, 0);
+                        for (int s = 0; s < samples_this_pass; s++) {
+                            if ((s & 15) == 0 && cancel_requested()) break;
+                            double offset_x = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
+                            double offset_y = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
+                            double u = (i + offset_x) / std::max(1, scene.width - 1);
+                            double v = (sample_row + offset_y) / std::max(1, scene.height - 1);
+                            Color sample = ray_color(
+                                scene.camera->get_ray(u, v), scene, scene.max_depth, options, infinity, false);
+                            col += clamp_radiance(sample, scene.firefly_clamp);
+                        }
+                        if (cancelled.load()) break;
+                        output.pixels[static_cast<size_t>(j) * static_cast<size_t>(scene.width) +
+                                      static_cast<size_t>(i)] += col;
+                    }
+                    if (!cancelled.load()) report_progress(sample_start, scene.samples, false);
+                }
+            };
+
+            std::vector<std::thread> workers;
+            workers.reserve(static_cast<size_t>(thread_count));
+            for (int t = 0; t < thread_count; t++) {
+                workers.emplace_back(render_pass_worker);
+            }
+            for (std::thread& worker : workers) {
+                worker.join();
             }
 
             if (cancelled.load()) break;
-            int done = rows_done.fetch_add(1) + 1;
-            report_progress(done);
+            int samples_done = sample_start + samples_this_pass;
+            report_progress(samples_done, scene.samples, false);
+            if (partial_enabled &&
+                (samples_done == scene.samples || samples_done - last_partial_samples >= partial_interval)) {
+                report_partial(double(samples_done) / double(scene.samples), samples_done);
+                last_partial_samples = samples_done;
+            }
         }
     };
 
-    std::vector<std::thread> workers;
-    workers.reserve(static_cast<size_t>(thread_count));
-    for (int t = 0; t < thread_count; t++) {
-        workers.emplace_back(render_worker);
-    }
-    for (std::thread& worker : workers) {
-        worker.join();
+    if (options.schedule == RenderSchedule::SamplePasses) {
+        render_sample_passes();
+    } else {
+        render_rows();
     }
 
     output.cancelled = cancelled.load();
-    if (!output.cancelled && callbacks.progress) callbacks.progress(1.0);
+    if (!output.cancelled) {
+        int total_units = options.schedule == RenderSchedule::SamplePasses ? scene.samples : scene.height;
+        report_progress(total_units, total_units, false);
+    }
     return output;
 }
 

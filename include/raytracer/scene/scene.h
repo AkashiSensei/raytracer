@@ -45,6 +45,9 @@ struct Light {
     double radius = 0.25;
     double angle = 30.0;
     double soft_angle = 0.0;
+    bool visible_camera = false;
+    bool visible_specular = true;
+    bool visible_diffuse = false;
 
     double area() const {
         if (type == LightType::Sphere) return 4.0 * pi * radius * radius;
@@ -123,6 +126,34 @@ inline std::string resolve_asset_path(const std::filesystem::path& base_dir,
     return path.lexically_normal().string();
 }
 
+inline std::vector<unsigned char> decode_base64(const std::string& input) {
+    auto decode_char = [](unsigned char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+
+    std::vector<unsigned char> out;
+    int val = 0;
+    int valb = -8;
+    for (unsigned char c : input) {
+        if (c == '=') break;
+        if (std::isspace(c)) continue;
+        int d = decode_char(c);
+        if (d < 0) continue;
+        val = (val << 6) + d;
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<unsigned char>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
 inline Mat4 parse_transform(const JsonValue& obj) {
     if (obj.has("transform")) {
         const JsonValue& t = obj.at("transform");
@@ -173,6 +204,166 @@ inline std::string lower_ascii(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     return value;
+}
+
+inline std::shared_ptr<Texture> parse_texture_json(const JsonValue& texture,
+                                                   const std::filesystem::path& base_dir,
+                                                   const Color& fallback = Color(1, 1, 1)) {
+    if (texture.type == JsonValue::Array) {
+        return make_solid_texture(to_vec3(texture));
+    }
+    if (texture.type == JsonValue::String) {
+        return load_texture_from_path(base_dir, texture.strVal);
+    }
+    if (!texture.isObject()) {
+        return make_solid_texture(fallback);
+    }
+
+    std::string type = texture.has("type") ? lower_ascii(texture.at("type").strVal) : "image";
+    std::shared_ptr<Texture> result;
+    if (type == "checker" || type == "checkerboard") {
+        Color color1 = texture.has("color1") ? to_vec3(texture.at("color1")) : Color(0.8, 0.8, 0.8);
+        Color color2 = texture.has("color2") ? to_vec3(texture.at("color2")) : Color(0.2, 0.2, 0.2);
+        double scale = texture.has("scale") ? texture.at("scale").numVal : 5.0;
+        auto checker = std::make_shared<CheckerTexture>(color1, color2, scale);
+        if (texture.has("uv_scale")) checker->uv_scale = to_vec2(texture.at("uv_scale"));
+        if (texture.has("uv_offset")) checker->uv_offset = to_vec2(texture.at("uv_offset"));
+        if (texture.has("uv_rotation")) checker->uv_rotation = texture.at("uv_rotation").numVal;
+        result = checker;
+    } else if (type == "color_ramp" || type == "colorramp" || type == "ramp") {
+        std::shared_ptr<Texture> source = texture.has("source")
+            ? parse_texture_json(texture.at("source"), base_dir, Color(0, 0, 0))
+            : make_solid_texture(Color(0, 0, 0));
+        std::vector<std::pair<double, Color>> stops;
+        if (texture.has("stops") && texture.at("stops").isArray()) {
+            for (const JsonValue& stop : texture.at("stops").arrVal) {
+                if (!stop.isObject() || !stop.has("position") || !stop.has("color")) continue;
+                stops.push_back({std::clamp(stop.at("position").numVal, 0.0, 1.0),
+                                 to_vec3(stop.at("color"))});
+            }
+        }
+        auto ramp = std::make_shared<ColorRampTexture>(source, stops);
+        if (texture.has("interpolation")) {
+            std::string interpolation = lower_ascii(texture.at("interpolation").strVal);
+            if (interpolation == "constant") ramp->interpolation = ColorRampTexture::Interpolation::Constant;
+            else if (interpolation == "ease" || interpolation == "easing") ramp->interpolation = ColorRampTexture::Interpolation::Ease;
+        }
+        result = ramp;
+    } else if (type == "math") {
+        auto source_a = texture.has("a")
+            ? parse_texture_json(texture.at("a"), base_dir, Color(0, 0, 0))
+            : make_solid_texture(Color(0, 0, 0));
+        auto source_b = texture.has("b")
+            ? parse_texture_json(texture.at("b"), base_dir, Color(0, 0, 0))
+            : make_solid_texture(Color(0, 0, 0));
+        std::string operation = texture.has("operation")
+            ? lower_ascii(texture.at("operation").strVal)
+            : "add";
+        MathTexture::Operation op = MathTexture::Operation::Add;
+        if (operation == "subtract") op = MathTexture::Operation::Subtract;
+        else if (operation == "multiply") op = MathTexture::Operation::Multiply;
+        else if (operation == "divide") op = MathTexture::Operation::Divide;
+        else if (operation == "minimum") op = MathTexture::Operation::Minimum;
+        else if (operation == "maximum") op = MathTexture::Operation::Maximum;
+        else if (operation == "power") op = MathTexture::Operation::Power;
+        else if (operation == "less_than" || operation == "lessthan") op = MathTexture::Operation::LessThan;
+        else if (operation == "greater_than" || operation == "greaterthan") op = MathTexture::Operation::GreaterThan;
+        auto math = std::make_shared<MathTexture>(source_a, source_b, op);
+        if (texture.has("clamp")) math->clamp_result = texture.at("clamp").boolVal;
+        result = math;
+    } else if (type == "mix") {
+        auto factor = texture.has("factor")
+            ? parse_texture_json(texture.at("factor"), base_dir, Color(0.5, 0.5, 0.5))
+            : make_solid_texture(Color(0.5, 0.5, 0.5));
+        auto color1 = texture.has("color1")
+            ? parse_texture_json(texture.at("color1"), base_dir, Color(0, 0, 0))
+            : make_solid_texture(Color(0, 0, 0));
+        auto color2 = texture.has("color2")
+            ? parse_texture_json(texture.at("color2"), base_dir, Color(1, 1, 1))
+            : make_solid_texture(Color(1, 1, 1));
+        result = std::make_shared<MixTexture>(factor, color1, color2);
+    } else if (type == "invert") {
+        auto factor = texture.has("factor")
+            ? parse_texture_json(texture.at("factor"), base_dir, Color(1, 1, 1))
+            : make_solid_texture(Color(1, 1, 1));
+        auto color = texture.has("color")
+            ? parse_texture_json(texture.at("color"), base_dir, fallback)
+            : make_solid_texture(fallback);
+        result = std::make_shared<InvertTexture>(factor, color);
+    } else if (type == "map_range" || type == "maprange") {
+        auto value = texture.has("value")
+            ? parse_texture_json(texture.at("value"), base_dir, Color(0, 0, 0))
+            : make_solid_texture(Color(0, 0, 0));
+        auto mapped = std::make_shared<MapRangeTexture>(value);
+        if (texture.has("from_min")) mapped->from_min = texture.at("from_min").numVal;
+        if (texture.has("from_max")) mapped->from_max = texture.at("from_max").numVal;
+        if (texture.has("to_min")) mapped->to_min = texture.at("to_min").numVal;
+        if (texture.has("to_max")) mapped->to_max = texture.at("to_max").numVal;
+        if (texture.has("clamp")) mapped->clamp_result = texture.at("clamp").boolVal;
+        result = mapped;
+    } else if (type == "noise" || type == "noise_texture") {
+        auto noise = std::make_shared<NoiseTexture>();
+        if (texture.has("scale")) noise->scale = texture.at("scale").numVal;
+        if (texture.has("detail")) noise->detail = static_cast<int>(std::round(texture.at("detail").numVal));
+        if (texture.has("roughness")) noise->roughness = texture.at("roughness").numVal;
+        if (texture.has("distortion")) noise->distortion = texture.at("distortion").numVal;
+        result = noise;
+    } else if (type == "image" || type == "texture") {
+        std::shared_ptr<ImageTexture> image;
+        if (texture.has("data_base64")) {
+            std::string mime = texture.has("mime_type") ? texture.at("mime_type").strVal : "image/png";
+            std::vector<unsigned char> encoded = decode_base64(texture.at("data_base64").strVal);
+            if (encoded.empty()) {
+                throw std::runtime_error("image texture data_base64 is empty or invalid");
+            }
+            image = std::make_shared<ImageTexture>(encoded, mime);
+        } else {
+            std::string path;
+            if (texture.has("path")) path = texture.at("path").strVal;
+            else if (texture.has("file")) path = texture.at("file").strVal;
+            else if (texture.has("texture")) path = texture.at("texture").strVal;
+            if (path.empty()) {
+                throw std::runtime_error(
+                    "image texture requires path or data_base64; rebuild raytracer_server if using remote embedded textures");
+            }
+            image = std::make_shared<ImageTexture>(resolve_asset_path(base_dir, path));
+        }
+        if (texture.has("interpolation")) {
+            std::string interpolation = lower_ascii(texture.at("interpolation").strVal);
+            if (interpolation == "linear" || interpolation == "smart" || interpolation == "cubic") {
+                image->interpolation = ImageTexture::Interpolation::Linear;
+            }
+        }
+        if (texture.has("color_space")) {
+            std::string color_space = lower_ascii(texture.at("color_space").strVal);
+            image->decode_srgb = color_space.find("srgb") != std::string::npos;
+        }
+        if (texture.has("extension")) {
+            std::string extension = lower_ascii(texture.at("extension").strVal);
+            if (extension == "extend") image->extension = ImageTexture::Extension::Extend;
+            else if (extension == "clip") image->extension = ImageTexture::Extension::Clip;
+            else if (extension == "mirror" || extension == "mirror_repeat") image->extension = ImageTexture::Extension::Mirror;
+            else image->extension = ImageTexture::Extension::Repeat;
+        }
+        result = image;
+        if (texture.has("tint")) {
+            result = std::make_shared<TintedTexture>(result, to_vec3(texture.at("tint")));
+        }
+    } else if (type == "solid" || type == "color") {
+        result = make_solid_texture(texture.has("color") ? to_vec3(texture.at("color")) : fallback);
+    } else {
+        return make_solid_texture(fallback);
+    }
+
+    bool has_transform = texture.has("uv_scale") || texture.has("uv_offset");
+    bool has_rotation = texture.has("uv_rotation");
+    if ((has_transform || has_rotation) && type != "checker" && type != "checkerboard") {
+        Vec2 scale = texture.has("uv_scale") ? to_vec2(texture.at("uv_scale")) : Vec2(1.0, 1.0);
+        Vec2 offset = texture.has("uv_offset") ? to_vec2(texture.at("uv_offset")) : Vec2(0.0, 0.0);
+        double rotation = has_rotation ? texture.at("uv_rotation").numVal : 0.0;
+        result = std::make_shared<TransformedTexture>(result, scale, offset, rotation);
+    }
+    return result;
 }
 
 inline Vec3 safe_normalized(const Vec3& v, const Vec3& fallback) {
@@ -246,18 +437,12 @@ inline std::shared_ptr<Texture> material_texture_or_color(const JsonValue& m,
                                                           const Color& fallback) {
     if (m.has("texture")) {
         const JsonValue& texture = m.at("texture");
-        if (texture.type == JsonValue::String) {
-            return std::make_shared<TintedTexture>(
-                load_texture_from_path(base_dir, texture.strVal), fallback);
-        }
-        if (texture.has("path")) {
-            return std::make_shared<TintedTexture>(
-                load_texture_from_path(base_dir, texture.at("path").strVal), fallback);
-        }
+        return std::make_shared<TintedTexture>(
+            parse_texture_json(texture, base_dir, Color(1, 1, 1)), fallback);
     }
     if (m.has("albedo_texture")) {
         return std::make_shared<TintedTexture>(
-            load_texture_from_path(base_dir, m.at("albedo_texture").strVal), fallback);
+            parse_texture_json(m.at("albedo_texture"), base_dir, Color(1, 1, 1)), fallback);
     }
     return make_solid_texture(fallback);
 }
@@ -267,8 +452,8 @@ inline std::shared_ptr<Texture> parse_texture_color(const JsonValue& m,
                                                     const Color& default_color,
                                                     const std::filesystem::path& base_dir) {
     std::string map_key = base_key + "_map";
-    if (m.has(map_key)) return load_texture_from_path(base_dir, m.at(map_key).strVal);
-    if (m.has(base_key)) return make_solid_texture(to_vec3(m.at(base_key)));
+    if (m.has(map_key)) return parse_texture_json(m.at(map_key), base_dir, default_color);
+    if (m.has(base_key)) return parse_texture_json(m.at(base_key), base_dir, default_color);
     return make_solid_texture(default_color);
 }
 
@@ -277,7 +462,10 @@ inline std::shared_ptr<Texture> parse_texture_scalar(const JsonValue& m,
                                                      double default_val,
                                                      const std::filesystem::path& base_dir) {
     std::string map_key = base_key + "_map";
-    if (m.has(map_key)) return load_texture_from_path(base_dir, m.at(map_key).strVal);
+    if (m.has(map_key)) return parse_texture_json(m.at(map_key), base_dir, Color(default_val, 0, 0));
+    if (m.has(base_key) && !m.at(base_key).isNumber()) {
+        return parse_texture_json(m.at(base_key), base_dir, Color(default_val, 0, 0));
+    }
     double v = m.has(base_key) ? m.at(base_key).numVal : default_val;
     return make_solid_texture(Color(v, 0, 0));
 }
@@ -296,8 +484,10 @@ inline Material* parse_material(const JsonValue& m,
         Color albedo = m.has("albedo") ? to_vec3(m.at("albedo")) : Color(0.8, 0.8, 0.8);
         mat = std::make_unique<Metal>(material_texture_or_color(m, base_dir, albedo), fuzz);
     } else if (type == "dielectric") {
-        Color alb = m.has("albedo") ? to_vec3(m.at("albedo")) : Color(1.0, 1.0, 1.0);
-        auto dielectric = std::make_unique<Dielectric>(m.at("ior").numVal, alb);
+        auto albedo_tex = m.has("albedo")
+            ? parse_texture_json(m.at("albedo"), base_dir, Color(1.0, 1.0, 1.0))
+            : make_solid_texture(Color(1.0, 1.0, 1.0));
+        auto dielectric = std::make_unique<Dielectric>(m.at("ior").numVal, albedo_tex);
         if (m.has("roughness")) {
             dielectric->roughness = std::clamp(m.at("roughness").numVal, 0.0, 1.0);
         }
@@ -312,8 +502,8 @@ inline Material* parse_material(const JsonValue& m,
         auto albedo_tex = parse_texture_color(m, "albedo", Color(0.8, 0.8, 0.8), base_dir);
         auto metallic_tex = parse_texture_scalar(m, "metallic", 0.0, base_dir);
         auto roughness_tex = parse_texture_scalar(m, "roughness", 0.5, base_dir);
-        double met_def = m.has("metallic") ? m.at("metallic").numVal : 0.0;
-        double rough_def = m.has("roughness") ? m.at("roughness").numVal : 0.5;
+        double met_def = (m.has("metallic") && m.at("metallic").isNumber()) ? m.at("metallic").numVal : 0.0;
+        double rough_def = (m.has("roughness") && m.at("roughness").isNumber()) ? m.at("roughness").numVal : 0.5;
         auto pbr = std::make_unique<PBR>(albedo_tex, met_def, rough_def);
         pbr->metallic = metallic_tex;
         pbr->roughness = roughness_tex;
@@ -544,6 +734,9 @@ inline Light parse_light(const JsonValue& light_json) {
 
     if (light_json.has("color")) light.color = to_vec3(light_json.at("color"));
     if (light_json.has("intensity")) light.intensity = light_json.at("intensity").numVal;
+    if (light_json.has("visible_camera")) light.visible_camera = light_json.at("visible_camera").boolVal;
+    if (light_json.has("visible_specular")) light.visible_specular = light_json.at("visible_specular").boolVal;
+    if (light_json.has("visible_diffuse")) light.visible_diffuse = light_json.at("visible_diffuse").boolVal;
     return light;
 }
 
@@ -956,6 +1149,23 @@ inline double camera_vfov_from_json(const JsonValue& c, double aspect, double fa
     return fallback;
 }
 
+inline bool camera_has_frame(const JsonValue& c) {
+    if (!c.has("frame")) return false;
+    const JsonValue& frame = c.at("frame");
+    return frame.has("lower_left") && frame.has("horizontal") && frame.has("vertical");
+}
+
+inline std::unique_ptr<Camera> make_frame_camera(const JsonValue& c, double aspect) {
+    const JsonValue& frame = c.at("frame");
+    Point3 lookfrom = to_vec3(c.at("lookfrom"));
+    Point3 lower_left = to_vec3(frame.at("lower_left"));
+    Vec3 horizontal = to_vec3(frame.at("horizontal"));
+    Vec3 vertical = to_vec3(frame.at("vertical"));
+    double vfov = camera_vfov_from_json(c, aspect, 60.0);
+    double aperture = c.has("aperture") ? c.at("aperture").numVal : 0.0;
+    return std::make_unique<Camera>(lookfrom, lower_left, horizontal, vertical, aperture, vfov);
+}
+
 inline Camera make_auto_camera(const AABB& bounds, double aspect, const JsonValue* camera_json) {
     double vfov = 35.0;
     double aperture = 0.0;
@@ -1051,6 +1261,10 @@ inline std::unique_ptr<Camera> build_camera(const JsonValue& root,
     }
 
     const JsonValue& c = *camera_json;
+    if (camera_has_frame(c)) {
+        return make_frame_camera(c, aspect);
+    }
+
     Point3 lookfrom = to_vec3(c.at("lookfrom"));
     Point3 lookat   = to_vec3(c.at("lookat"));
     Vec3   vup      = c.has("vup") ? to_vec3(c.at("vup")) : Vec3(0, 1, 0);

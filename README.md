@@ -401,6 +401,7 @@ CLI 会保留这些默认项，这是命令行场景格式的易用性设计：�
 | `scenes/pbr_test.json` | PBR 金属-粗糙度材质验证 |
 | `scenes/texture_test.json` | 贴图采样验证 |
 | `scenes/textured_quad.json` | 带 UV 和棋盘纹理的最小贴图验证场景 |
+| `scenes/blender_room_texture_export.json` | Blender 导出的房间场景 fixture（相机 frame + rect 面光源 + image 贴图 Mapping） |
 | `scenes/disk_light_test.json` | disk 面积光软阴影验证（漫反射球 + 玻璃 + 金属） |
 | `scenes/mirror_glass_water.json` | 镜面金属 + 玻璃 + 水面 + PBR + 自发光面积灯验收场景 |
 | `scenes/studio_materials.json` | 使用 studio preset、环境背景、自动 framing、镜面/粗糙玻璃/水面的材质测试棚 |
@@ -613,6 +614,11 @@ raytracer/
 - ✅ GLB/OBJ 导入兼容：`alphaMode: MASK` + `alphaCutoff` 真正生效并穿透主光线/阴影光线、`doubleSided` 背面不剔除、`KHR_texture_transform` UV scale/offset、MTL `map_Ks` / `map_Ns` / `map_d` 贴图
 - ✅ 输出色彩控制：ACES / Reinhard / None 色调映射 + 可调 exposure
 - ✅ PBR 走 NEE（Cook-Torrance 的 f/pdf 实现 + MIS 权重）
+- ✅ Blender RenderEngine 接入：本地 bridge / 远程 server 渲染、evaluated mesh 导出、调试缓存、活动相机 `view_frame()` 显式取景平面导出，使视角/缩放更接近 Cycles
+- ✅ Blender 解析光源导出：Point / Sun / Spot，以及 Area Light 的 rect / disk 面光源采样；Area 默认相机不可见、specular/glossy 可见，并提供“面光源相机可见”插件选项
+- ✅ Blender 材质贴图导出：Principled BSDF 的基础色 / 金属度 / 糙度支持 Checker、Image、Noise、ColorRamp、Math、Mix、Invert、Map Range、RGB/Value 等常见节点，并导出 Mapping 的 scale / offset / rotation
+- ✅ Blender 贴图坐标与诊断：导出 active UV，支持 Generated/Object 近似坐标，记录 unsupported texture 节点和混合坐标诊断，并提供 `scripts/inspect_texture_export.py` 检查调试缓存
+- ✅ Blender 渐进预览、状态展示与采样调度：本地 bridge 通过 `STATUS`/`PARTIAL`，远程 server 通过 `/jobs/<id>/progress`/`partial` 逐步刷新 Render Result 和 samples/pixels/elapsed/remaining 信息；支持按行完成和全图 sample batch 累积两种顺序，本地默认 batch 16、远程默认 batch 64，最终图像路径不变
 - ✅ 性能 profiling：`--stats-format json` + `scripts/benchmark_report.py`（CSV/JSON/MD，分类定位透明/网格重瓶颈）
 - ✅ 渲染质量自动报告：`scripts/render_report.py`（批量渲染 → PNG 校验 → contact sheet → markdown 验收报告）+ `scripts/html_report.py`（自包含 HTML 报告 + 高清原图 modal 灯箱）
 - ✅ Golden 回归覆盖扩展：default、mirror_glass_water、Khronos WaterBottle/CompareMetallic/Attenuation/CompareRoughness/TransmissionRoughness、OBJ MTL、扩展 MTL、glass_emissive、bunny、no-normal OBJ、studio_materials

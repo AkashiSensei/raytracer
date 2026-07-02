@@ -74,7 +74,7 @@
 - `远程地址` 填写服务器地址，例如 `http://192.168.1.10:8080`。
 - 根据需要调整 `采样数`、`最大深度`、`线程数` 和 `仅直接光照`。这里的 `线程数` 是本次渲染请求使用的线程数；如果客户端不传，server 才会使用启动时的 `--default-threads`；如果超过 server 的 `--max-request-threads`，server 会按最大值执行。
 
-插件会把当前 Blender 场景导出为内部 JSON 包，通过 `POST /jobs` 创建远程渲染任务；随后轮询任务进度，渲染完成后下载 RGBA32F 图像并显示。如果在 Blender 中取消渲染，插件会向 server 发送取消请求，server 会尽快停止对应任务。
+插件会把当前 Blender 场景导出为内部 JSON 包，通过 `POST /jobs` 创建远程渲染任务；随后轮询任务进度和渐进预览，渲染完成后下载 RGBA32F 图像并显示。如果在 Blender 中取消渲染，插件会向 server 发送取消请求，server 会尽快停止对应任务。
 
 也可以用命令行快速检查服务是否可用：
 
@@ -85,7 +85,7 @@ curl http://127.0.0.1:8080/health
 远程渲染接口：
 
 ```text
-POST /jobs?threads=8&direct_only=0
+POST /jobs?threads=8&direct_only=0&render_schedule=sample_passes&partial_update_interval=1
 Content-Type: application/json
 
 <Blender 插件导出的内部场景 JSON>
@@ -101,11 +101,12 @@ Content-Type: application/json
 
 ```text
 GET  /jobs/<job_id>/progress
+GET  /jobs/<job_id>/partial
 GET  /jobs/<job_id>/result
 POST /jobs/<job_id>/cancel
 ```
 
-`/result` 在任务完成后返回 `application/octet-stream`，内容是本项目的 `RTRGBAF1` RGBA32F 二进制图像。`POST /render` 作为同步调试接口仍保留，但 Blender 插件默认使用任务式接口。
+`render_schedule` 可选 `rows` 或 `sample_passes`。`sample_passes` 的采样批次由后端固定选择：本地 bridge 为 `16`，远程 server 为 `64`。`partial_update_interval` 在 `rows` 下表示预览行批次间隔，在 `sample_passes` 下表示 sample 间隔；旧的 `partial_update_rows` 仍作为兼容别名。`/progress` 会返回任务状态、归一化进度、`partial_seq`、当前调度的 samples/rows/pixels 计数，以及 elapsed/remaining 秒数。当 `partial_seq` 变化时，`/partial` 返回当前最新的 `application/octet-stream` 预览图，内容同样是本项目的 `RTRGBAF1` RGBA32F 二进制图像；还没有预览时返回 `202 Accepted`。`/result` 在任务完成后返回最终图像。`POST /render` 作为同步调试接口仍保留，但 Blender 插件默认使用任务式接口。
 
 ## 参数说明
 
@@ -119,9 +120,12 @@ POST /jobs/<job_id>/cancel
 | `最大深度` | 光线递归反弹深度上限 |
 | `线程数` | 本次渲染请求让 C++ 渲染端使用的 CPU 线程数；远程模式下会随请求发给 server |
 | `仅直接光照` | 只计算相机射线、直接光照、阴影和环境光，不做递归随机反弹；适合快速预览 |
+| `采样调度` | 控制渲染任务顺序。`按行完成` 会先完成一批像素行，`全图累积` 会每轮给整张图增加采样，更接近 Cycles 的渐进预览 |
+| `渐进预览` | 渲染期间刷新 Blender Render Result；本地 bridge 和远程 server 都支持，最终图像不受影响 |
 | `灯光强度倍率` | Blender 光照导出为 raytracer 内部光照强度前应用的倍率，默认 `0.03` |
 | `背景` | Blender 路径显式导出的背景。默认 `黑色`，也可选 `World 表面`、`自定义颜色` 或 raytracer 内置 `天空` |
 | `环境光` | 简单全局补光开关。默认关闭；开启后按 `环境光颜色 * 环境光强度 * 灯光强度倍率` 导出，环境光强度默认 `5.0` |
+| `面光源相机可见` | 控制 Blender Area Light 是否能被相机直接看到。默认关闭；面光源默认仍会在玻璃、金属等 specular/glossy 路径中可见 |
 | `调试缓存` | 可选目录。填写后每次渲染会在该目录下创建一个 `raytracer_...` 子目录，保存中间 JSON、日志和结果文件 |
 
 Blender 路径不会触发 CLI 的默认天空、默认灯光或默认环境光。插件会显式导出：
@@ -144,15 +148,17 @@ Blender 插件只承诺导出渲染核心已经支持或可以合理近似的内
 |--------------|----------|----------|------|
 | `F12` 最终渲染 | 当前 evaluated scene 的内部 JSON | bridge/server 调用共享 `render_scene()` | 不接管实时 viewport path tracing |
 | 本地后端 | `raytracer_blender_bridge` 子进程 | 读取 JSON，输出 `RTRGBAF1` RGBA32F | 插件把结果写回 Blender `Combined` pass |
-| 远程后端 | HTTP `POST /jobs` | server 后台渲染、轮询进度、下载结果 | 当前是 CPU 核心；CUDA/GPU 尚未实现 |
+| 远程后端 | HTTP `POST /jobs` | server 后台渲染、轮询进度/预览、下载结果 | 当前是 CPU 核心；CUDA/GPU 尚未实现 |
 | 取消渲染 | Blender `test_break()` | 本地终止子进程；远程发送 `/cancel` | server 会尽快停止对应任务 |
 | 进度条 | bridge stderr `PROGRESS` 或远程 progress API | Blender `update_progress()` | 不是逐采样进度，是按行/任务状态汇报 |
+| 渲染状态 | bridge stderr `STATUS` 或远程 progress API | Blender `update_stats()` | `按行完成` 显示 Pixels，`全图累积` 显示 Samples，并附带 elapsed/remaining |
+| 渐进预览 | bridge stderr `PARTIAL` 或远程 `/partial` | Blender `begin_result()/end_result()` 刷新 `Combined` pass | `按行完成` 为行级填充；`全图累积` 按采样批次进行全画面降噪 |
 
 ### 相机与输出
 
 | Blender 内容 | 导出内容 | 核心处理 | 备注 |
 |--------------|----------|----------|------|
-| 当前活动摄像机 | `camera.lookfrom/lookat/vup/vfov/focus_dist/aperture` | 生成 primary ray | 必须有 active camera |
+| 当前活动摄像机 | `camera.lookfrom/lookat/vup/vfov/focus_dist/aperture/frame` | 生成 primary ray | 必须有 active camera；优先使用 Blender `view_frame()` 导出的显式取景平面，使视角/缩放更接近 Cycles |
 | 分辨率与百分比 | `image.width/height` | 输出对应尺寸 RGBA32F | 使用 `render.resolution_percentage` 后的尺寸 |
 | 采样数 | `image.samples` | 每像素 Monte Carlo 采样 | `仅直接光照` 且 1 sample 时使用像素中心采样 |
 | 最大深度 | `image.max_depth` | 路径递归深度上限 | 对 `仅直接光照` 影响很小 |
@@ -167,7 +173,7 @@ Blender 插件只承诺导出渲染核心已经支持或可以合理近似的内
 | 修改器、骨骼、动画姿态 | evaluated mesh 当前帧结果 | 当作静态三角网格渲染 | 不导出骨骼或动画，只导出当前帧几何 |
 | 对象世界变换 | 已烘焙到顶点坐标 | 核心收到世界坐标三角形 | 不另存 Blender object transform |
 | 多材质槽 | 按材质索引拆成多个 triangle object | 每组绑定一个核心材质 | 调试 JSON 中可看到拆分后的对象 |
-| UV | `uvs` | 用于核心贴图/材质采样 | 当前 Blender 插件不展开复杂贴图网络 |
+| UV | `uvs` | 用于核心贴图/材质采样 | 有 active UV 时导出 active UV；没有 UV 时会为 generated 坐标路径生成包围盒平面坐标 |
 | Loop normal | `normals` | 命中后插值法线 | 更接近 Blender 平滑/平面着色结果 |
 | 渲染禁用 | 跳过 `hide_render` 对象 | 不进入核心场景 | 对几何和灯光都生效 |
 
@@ -193,11 +199,12 @@ Blender 路径会显式导出 `background`、`lighting.ambient` 和 `lights`，�
 | Point | `lights[].type = "point"`，位置、颜色、`energy * 灯光强度倍率` | 点光源，平方距离衰减，发阴影射线 | 位置会影响照明 |
 | Sun | `lights[].type = "directional"`，方向、颜色、`energy * 灯光强度倍率` | 方向光，无距离衰减，发阴影射线 | 只使用旋转方向，移动位置无影响 |
 | Spot | 近似导出为 point，强度为 `energy * 灯光强度倍率` | 当点光源处理 | 当前不支持锥角、半影 |
-| Area | 近似导出为 point，强度为 `energy * 灯光强度倍率` | 当点光源处理 | 不是真正面光源采样 |
+| Area Square / Rectangle | `lights[].type = "rect"`，中心、方向、`u/v` 尺寸向量、颜色、强度、可见性标记 | 解析矩形面光源，支持面积采样、软阴影和 specular 命中 | 默认相机不可见、specular 可见；`面光源相机可见` 可让相机直接看到灯面 |
+| Area Disk / Ellipse | `lights[].type = "disk"`，中心、方向、半径、颜色、强度、可见性标记 | 解析圆盘面光源，支持面积采样、软阴影和 specular 命中 | Ellipse 当前按等面积近似为圆盘 |
 | 禁用渲染的灯 | 不导出 | 无贡献 | 读取 `hide_render` |
 | 发光材质 | `emissive` 材质 | 作为自发光表面，可参与路径追踪 | 这是材质贡献，不是 Blender Light 对象 |
 
-核心直接光照会遍历点光/方向光并发阴影射线；被遮挡的光源不会给当前命中点贡献直接光照。真正的面光源、体积光、IES、灯光半径/柔和阴影、spot cone 暂不支持。
+核心直接光照会遍历点光/方向光/解析面光源并发阴影射线；被遮挡的光源不会给当前命中点贡献直接光照。Area Light 会按面积采样形成软阴影，也可以被 specular/glossy 反射或折射路径命中。体积光、IES、点/聚光灯半径、spot cone 暂不支持。
 
 `灯光强度倍率` 是 Blender 接入层的单位标定。渲染核心仍使用自己的内部光照单位；插件负责把 Blender 的灯光 `energy` 和插件环境光强度映射到该内部单位。默认 `0.03` 是为了让 Blender 常见点光能量在当前简化光照模型里更接近可调试范围。若希望更接近某个 EEVEE/Cycles 参考图，可以直接调这个倍率，并在 `调试缓存/scene.rt.json` 中查看最终导出的 `lights[].intensity` 和 `lighting.ambient`。
 
@@ -208,14 +215,41 @@ Blender 插件会把当前材质近似转换成本项目渲染核心支持的材
 | Blender Principled BSDF | 导出内容 | 核心处理 | 备注 |
 |-------------------------|----------|----------|------|
 | 无材质 | `pbr` 默认灰色 | PBR 材质 | `albedo=[0.8,0.8,0.8]` |
-| `基础色` | `pbr.albedo` | PBR 基础色 | 支持未连接贴图时的颜色值；复杂节点网络暂不展开 |
-| `金属度` | `pbr.metallic` | PBR metallic | 范围夹到 `[0,1]` |
-| `糙度` | `pbr.roughness` | PBR roughness | 范围夹到 `[0.001,1]` |
+| `基础色` | `pbr.albedo` 或贴图对象 | PBR 基础色 | 支持颜色值，也支持下方列出的常见贴图节点链 |
+| `金属度` | `pbr.metallic` 或贴图对象 | PBR metallic | 标量或标量贴图；最终范围夹到 `[0,1]` |
+| `糙度` | `pbr.roughness` 或贴图对象 | PBR roughness | 标量或标量贴图；最终范围夹到 `[0.001,1]` |
 | `自发光颜色 * 自发光强度` | `emissive.emission` | 自发光材质，可作为面光源 | 强度大于 0 时优先导出为 emissive |
 | `Alpha < 0.35` | `dielectric` | 折射/反射介质 | 作为透明介质近似 |
 | `透射 / Transmission Weight > 0.5` | `dielectric` | 折射/反射介质 | 作为玻璃/水等近似 |
 | `折射率 (IOR)` | `dielectric.ior` | Schlick Fresnel + 折射方向 | 仅导出为 dielectric 时生效 |
-| `基础色` + dielectric | `dielectric.albedo` | 有色玻璃近似 | 核心会用颜色衰减透射/反射 |
+| `基础色` + dielectric | `dielectric.albedo` 或贴图对象 | 有色玻璃近似 | 核心会用颜色衰减透射/反射 |
+
+#### 贴图节点与映射关系
+
+插件会从 Principled BSDF 的 `基础色`、`金属度`、`糙度` 输入沿连接向前解析一组常见节点，并导出为核心可采样的 texture JSON。当前支持：
+
+| Blender 节点/连接 | 导出内容 | 核心处理 | 备注 |
+|-------------------|----------|----------|------|
+| Checker Texture | `{type:"checker", color1, color2, scale, coord, uv_scale, uv_offset, uv_rotation}` | 程序棋盘纹理 | 支持 Color 输出；连接 Fac 输出时按黑白系数导出 |
+| Image Texture | `{type:"image", path, interpolation, extension, color_space, coord, uv_*}` | 图片贴图采样 | 支持 Repeat / Extend / Clip / Mirror，Nearest / Linear，sRGB 解码 |
+| Noise Texture | `{type:"noise", scale, detail, roughness, distortion, coord, uv_*}` | 程序噪声近似 | 用确定性灰度噪声近似 Blender/Cycles 噪声，不保证完全一致 |
+| ColorRamp | `{type:"color_ramp", source, stops, interpolation}` | 颜色渐变映射 | 支持 Linear / Constant / Ease |
+| Math | `{type:"math", operation, a, b, clamp}` | 标量运算 | 支持常见二元运算，例如 add/subtract/multiply/divide/min/max/power/compare |
+| Mix / MixRGB | `{type:"mix", factor, color1, color2}` | 线性插值 | `MixRGB` 目前只支持 Mix 混合模式 |
+| Invert | `{type:"invert", factor, color}` | 颜色反相 | 可用于基础色路径 |
+| Map Range | `{type:"map_range", value, from_min, from_max, to_min, to_max, clamp}` | 标量重映射 | 非 Linear 插值会记录为 unsupported 诊断 |
+| RGB / Value | `{type:"solid", color}` | 常量颜色或常量标量 | Value 会导出为灰度 solid |
+| Reroute | 不单独导出 | 继续追踪输入来源 | 用于整理节点图时不影响导出 |
+
+Mapping 节点会被折叠进被连接的贴图对象：
+
+| Blender Mapping 输入 | 导出字段 | 核心处理 |
+|----------------------|----------|----------|
+| `Scale X/Y` | `uv_scale` | 采样前缩放 UV |
+| `Location X/Y` | `uv_offset` | 缩放/旋转后平移 UV |
+| `Rotation Z` | `uv_rotation`，单位为度 | 在 UV 平面内旋转 |
+
+Texture Coordinate 节点当前识别 `UV`、`Generated` 和 `Object`/`Generated` 类路径。`UV` 会使用 mesh 的 active UV；`Generated`/`Object` 会使用导出时按对象局部包围盒生成的近似坐标。若同一个材质组同时混用 UV 和 Generated 坐标，插件会保留 active UV，并在材质 JSON 上写入 `mixed_texture_coords` 诊断。
 
 核心材质大致处理方式：
 
@@ -223,7 +257,7 @@ Blender 插件会把当前材质近似转换成本项目渲染核心支持的材
 - `dielectric`：玻璃/水等透明介质，使用 IOR、反射/折射和 Schlick Fresnel。
 - `emissive`：直接返回发光颜色，并登记为可采样发光表面。
 
-目前不会导出 Blender 的次表面散射、涂层、边缘光泽、薄膜、体积、背面剔除、阴影模式和完整节点图；这些没有直接对应的核心材质参数。贴图节点如果没有被插件显式解析，也不会自动转换成核心贴图。
+目前不会导出 Blender 的次表面散射、涂层、边缘光泽、薄膜、体积、背面剔除、阴影模式和完整节点图；这些没有直接对应的核心材质参数。贴图节点如果没有被插件显式解析，会在材质 JSON 的 `unsupported_textures` 中记录诊断，并回退到对应输入的默认值或常量值。
 
 ### 调试缓存
 
@@ -236,10 +270,18 @@ Blender 插件会把当前材质近似转换成本项目渲染核心支持的材
 | 远程进度 | `remote_progress.log` | 查看 job 状态 |
 | 渲染结果 | `result.rgba32f` | Blender 收到的线性 RGBA float 图像 |
 
+仓库提供了一个小工具用于检查最新调试缓存中的贴图导出情况：
+
+```bash
+python3 scripts/inspect_texture_export.py debug --fail-on-unsupported
+```
+
+传入调试缓存根目录时，脚本会自动选择最新的 `raytracer_.../scene.rt.json`。如果希望确认场景中确实导出了 Checker Texture，可以额外加 `--expect-checker`。
+
 ## 当前限制
 
-- 不支持完整 Blender 节点材质图和复杂贴图网络。
-- 不支持真正的面光源采样、体光源、World HDRI/Sky Texture。
+- 不支持完整 Blender 节点材质图；当前只解析上面列出的常见贴图节点链。
+- 不支持体光源、World HDRI/Sky Texture。
 - 不支持交互式 viewport path tracing、AOV/pass、多视图层差异化输出。
 - 不支持运动模糊、体积散射、粒子/毛发专用渲染属性。
 - 远程模式当前使用轮询查询进度，不是 WebSocket/SSE 流式推送。

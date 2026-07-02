@@ -10,7 +10,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <mutex>
+#include <sstream>
 #include <string>
 
 namespace {
@@ -20,6 +24,7 @@ struct BridgeArgs {
     std::string out_float_path;
     int samples_override = -1;
     int max_depth_override = -1;
+    std::string partial_dir;
     RenderOptions render_options;
 };
 
@@ -30,6 +35,10 @@ void print_usage(const char* prog) {
               << "  --samples <n>        samples per pixel override\n"
               << "  --max-depth <n>      ray recursion depth override\n"
               << "  --threads <n>        render worker threads\n"
+              << "  --render-schedule <rows|sample-passes> render ordering, default rows\n"
+              << "  --partial-dir <path> write progressive RGBA32F preview snapshots\n"
+              << "  --partial-update-interval <n> rows or sample passes between preview snapshots\n"
+              << "  --partial-update-rows <n> compatibility alias for row preview interval\n"
               << "  --direct-only        disable recursive random bounces\n"
               << "  --version            print bridge protocol version\n";
 }
@@ -45,6 +54,25 @@ bool parse_args(int argc, char* argv[], BridgeArgs& args) {
             args.samples_override = std::stoi(argv[++i]);
         } else if (arg == "--max-depth" && i + 1 < argc) {
             args.max_depth_override = std::stoi(argv[++i]);
+        } else if (arg == "--partial-dir" && i + 1 < argc) {
+            args.partial_dir = argv[++i];
+        } else if (arg == "--render-schedule" && i + 1 < argc) {
+            std::string schedule = argv[++i];
+            if (schedule == "rows" || schedule == "row") {
+                args.render_options.schedule = RenderSchedule::Rows;
+            } else if (schedule == "sample-passes" || schedule == "sample_passes" ||
+                       schedule == "sample-pass" || schedule == "sample_pass") {
+                args.render_options.schedule = RenderSchedule::SamplePasses;
+            } else {
+                std::cerr << "--render-schedule must be rows or sample-passes\n";
+                return false;
+            }
+        } else if ((arg == "--partial-update-interval" || arg == "--partial-update-rows") && i + 1 < argc) {
+            args.render_options.partial_update_interval = std::stoi(argv[++i]);
+            if (args.render_options.partial_update_interval <= 0) {
+                std::cerr << arg << " must be greater than 0\n";
+                return false;
+            }
         } else if (arg == "--threads" && i + 1 < argc) {
             args.render_options.threads = std::stoi(argv[++i]);
             if (args.render_options.threads <= 0) {
@@ -72,6 +100,23 @@ bool parse_args(int argc, char* argv[], BridgeArgs& args) {
     return true;
 }
 
+std::string status_json(const RenderProgressInfo& info) {
+    std::ostringstream out;
+    out << "{"
+        << "\"schedule\":\"" << render_schedule_name(info.schedule) << "\","
+        << "\"progress\":" << std::clamp(info.progress, 0.0, 1.0) << ","
+        << "\"samples_done\":" << info.samples_done << ","
+        << "\"samples_total\":" << info.samples_total << ","
+        << "\"rows_done\":" << info.rows_done << ","
+        << "\"rows_total\":" << info.rows_total << ","
+        << "\"pixels_done\":" << info.pixels_done << ","
+        << "\"pixels_total\":" << info.pixels_total << ","
+        << "\"elapsed_seconds\":" << info.elapsed_seconds << ","
+        << "\"remaining_seconds\":" << info.remaining_seconds
+        << "}";
+    return out.str();
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -91,6 +136,12 @@ int main(int argc, char* argv[]) {
 
     if (args.samples_override > 0) scene.samples = args.samples_override;
     if (args.max_depth_override > 0) scene.max_depth = args.max_depth_override;
+    if (!args.partial_dir.empty() && args.render_options.partial_update_interval <= 0) {
+        int units = args.render_options.schedule == RenderSchedule::SamplePasses
+            ? scene.samples
+            : scene.height;
+        args.render_options.partial_update_interval = std::max(1, units / 20);
+    }
 
     const char* environment_type = "gradient";
     if (scene.environment.type == EnvironmentType::Solid) environment_type = "solid";
@@ -102,16 +153,48 @@ int main(int argc, char* argv[]) {
               << " depth=" << scene.max_depth
               << " primitives=" << scene.primitive_count
               << " lights=" << scene.lights.size()
+              << " schedule=" << render_schedule_name(args.render_options.schedule)
+              << " sample_pass_batch=" << args.render_options.sample_pass_batch
               << " ambient=(" << scene.ambient_light.x << ","
               << scene.ambient_light.y << "," << scene.ambient_light.z << ")"
               << " environment=" << environment_type
               << "\n";
 
+    std::mutex log_mutex;
     RenderCallbacks callbacks;
-    callbacks.progress = [](double progress) {
+    callbacks.progress = [&](double progress) {
         double clamped = std::clamp(progress, 0.0, 1.0);
+        std::lock_guard<std::mutex> lock(log_mutex);
         std::cerr << "PROGRESS " << clamped << "\n" << std::flush;
     };
+    callbacks.status = [&](const RenderProgressInfo& info) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        std::cerr << "STATUS " << status_json(info) << "\n" << std::flush;
+    };
+    if (!args.partial_dir.empty()) {
+        try {
+            std::filesystem::create_directories(args.partial_dir);
+        } catch (const std::exception& e) {
+            std::cerr << "ERROR creating partial directory: " << e.what() << "\n";
+            return 1;
+        }
+
+        int partial_seq = 0;
+        callbacks.partial = [&](const RenderOutput& partial, double progress) {
+            std::ostringstream name;
+            name << "partial_" << std::setw(6) << std::setfill('0') << (++partial_seq) << ".rgba32f";
+            std::filesystem::path partial_path = std::filesystem::path(args.partial_dir) / name.str();
+            try {
+                write_rgba32f(partial_path.string(), partial);
+                double clamped = std::clamp(progress, 0.0, 1.0);
+                std::lock_guard<std::mutex> lock(log_mutex);
+                std::cerr << "PARTIAL " << clamped << " " << partial_path.string() << "\n" << std::flush;
+            } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lock(log_mutex);
+                std::cerr << "ERROR writing partial result: " << e.what() << "\n" << std::flush;
+            }
+        };
+    }
 
     RenderOutput output = render_scene(scene, args.render_options, callbacks);
     if (output.cancelled) {
