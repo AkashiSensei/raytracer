@@ -917,6 +917,11 @@ class RendererClient:
         raise NotImplementedError
 
 
+def progressive_update_rows(package):
+    height = int(package.get("image", {}).get("height", 1))
+    return max(1, height // 20)
+
+
 class LocalSubprocessRenderer(RendererClient):
     def __init__(self, bridge_path):
         self.bridge_path = bridge_path
@@ -934,6 +939,12 @@ class LocalSubprocessRenderer(RendererClient):
             "--out-float", str(result_path),
             "--threads", str(max(1, int(settings.threads))),
         ]
+        if settings.progressive_preview:
+            partial_dir = Path(work_dir) / "partials"
+            cmd.extend([
+                "--partial-dir", str(partial_dir),
+                "--partial-update-rows", str(progressive_update_rows(package)),
+            ])
         if settings.direct_only:
             cmd.append("--direct-only")
         write_debug_text(debug_cache, "command.txt", " ".join(cmd) + "\n")
@@ -955,6 +966,15 @@ class LocalSubprocessRenderer(RendererClient):
                             engine.update_progress(float(line.split()[1]))
                         except (IndexError, ValueError):
                             pass
+                    elif line.startswith("PARTIAL "):
+                        try:
+                            parts = line.split(" ", 2)
+                            progress = float(parts[1])
+                            pixels = read_rgba32f(parts[2].strip())
+                            engine.update_render_pixels(pixels)
+                            engine.update_progress(max(0.0, min(0.98, progress)))
+                        except Exception as exc:
+                            stderr_lines.append("PARTIAL preview failed: " + str(exc))
                     if engine.test_break():
                         process.terminate()
                         raise RuntimeError("Render cancelled")
@@ -1037,10 +1057,13 @@ class RemoteHttpRenderer(RendererClient):
 
     def render(self, package, engine, settings, debug_cache=None):
         deadline = time.monotonic() + max(1, int(settings.remote_timeout))
-        params = urllib.parse.urlencode({
+        render_params = {
             "threads": max(1, int(settings.threads)),
             "direct_only": "1" if settings.direct_only else "0",
-        })
+        }
+        if settings.progressive_preview:
+            render_params["partial_update_rows"] = progressive_update_rows(package)
+        params = urllib.parse.urlencode(render_params)
         write_debug_text(debug_cache, "remote_request.txt", self.url("/jobs") + "?" + params + "\n")
 
         body = json.dumps(package, separators=(",", ":")).encode("utf-8")
@@ -1066,9 +1089,11 @@ class RemoteHttpRenderer(RendererClient):
 
         quoted_job_id = urllib.parse.quote(job_id, safe="")
         progress_url = self.url("/jobs/" + quoted_job_id + "/progress")
+        partial_url = self.url("/jobs/" + quoted_job_id + "/partial")
         result_url = self.url("/jobs/" + quoted_job_id + "/result")
         engine.update_progress(0.0)
         progress_lines = []
+        last_partial_seq = 0
 
         while True:
             if engine.test_break():
@@ -1082,6 +1107,24 @@ class RemoteHttpRenderer(RendererClient):
             engine.update_progress(max(0.0, min(0.98, progress)))
             progress_lines.append(json.dumps(status, separators=(",", ":")))
             write_debug_text(debug_cache, "remote_progress.log", "\n".join(progress_lines) + "\n")
+
+            partial_seq = int(status.get("partial_seq", 0))
+            if settings.progressive_preview and partial_seq > last_partial_seq:
+                partial_request = urllib.request.Request(partial_url, headers={"Accept": "application/octet-stream"})
+                try:
+                    with urllib.request.urlopen(partial_request, timeout=self.request_timeout(deadline)) as response:
+                        partial = response.read()
+                    last_partial_seq = partial_seq
+                    write_debug_bytes(debug_cache, "remote_partial_%06d.rgba32f" % partial_seq, partial)
+                    engine.update_render_pixels(parse_rgba32f(partial))
+                except urllib.error.HTTPError as exc:
+                    if exc.code not in (202, 404):
+                        details = exc.read().decode("utf-8", errors="replace").strip()
+                        raise RuntimeError(
+                            "Remote renderer failed: HTTP " + str(exc.code) + ("\n" + details if details else "")
+                        )
+                except urllib.error.URLError as exc:
+                    raise RuntimeError("Remote renderer unavailable: " + str(exc.reason))
 
             if state == "done":
                 break
@@ -1174,6 +1217,11 @@ class RaytracerSettings(bpy.types.PropertyGroup):
     max_depth: IntProperty(name="最大深度", default=16, min=1, max=256)
     threads: IntProperty(name="线程数", default=8, min=1, max=128)
     direct_only: BoolProperty(name="仅直接光照", default=False)
+    progressive_preview: BoolProperty(
+        name="渐进预览",
+        default=True,
+        description="渲染期间逐步刷新 Render Result；本地和远程后端均支持",
+    )
     light_intensity_scale: FloatProperty(
         name="灯光强度倍率",
         default=0.03,
@@ -1238,15 +1286,18 @@ class RaytracerRenderEngine(bpy.types.RenderEngine):
             if self.test_break():
                 return
 
-            result = self.begin_result(0, 0, pixels.width, pixels.height)
-            layer = result.layers[0].passes["Combined"]
-            layer.rect = pixels.blender_rect()
-            self.end_result(result)
+            self.update_render_pixels(pixels)
             self.update_progress(1.0)
         except Exception as exc:
             message = str(exc)
             self.error_set(message)
             self.report({"ERROR"}, message)
+
+    def update_render_pixels(self, pixels):
+        result = self.begin_result(0, 0, pixels.width, pixels.height)
+        layer = result.layers[0].passes["Combined"]
+        layer.rect = pixels.blender_rect()
+        self.end_result(result)
 
 
 class RENDER_PT_raytracer_settings(bpy.types.Panel):
@@ -1277,6 +1328,7 @@ class RENDER_PT_raytracer_settings(bpy.types.Panel):
         render_box.prop(settings, "max_depth")
         render_box.prop(settings, "threads")
         render_box.prop(settings, "direct_only")
+        render_box.prop(settings, "progressive_preview")
 
         lighting_box = layout.box()
         lighting_box.label(text="光照")

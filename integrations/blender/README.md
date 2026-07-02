@@ -74,7 +74,7 @@
 - `远程地址` 填写服务器地址，例如 `http://192.168.1.10:8080`。
 - 根据需要调整 `采样数`、`最大深度`、`线程数` 和 `仅直接光照`。这里的 `线程数` 是本次渲染请求使用的线程数；如果客户端不传，server 才会使用启动时的 `--default-threads`；如果超过 server 的 `--max-request-threads`，server 会按最大值执行。
 
-插件会把当前 Blender 场景导出为内部 JSON 包，通过 `POST /jobs` 创建远程渲染任务；随后轮询任务进度，渲染完成后下载 RGBA32F 图像并显示。如果在 Blender 中取消渲染，插件会向 server 发送取消请求，server 会尽快停止对应任务。
+插件会把当前 Blender 场景导出为内部 JSON 包，通过 `POST /jobs` 创建远程渲染任务；随后轮询任务进度和渐进预览，渲染完成后下载 RGBA32F 图像并显示。如果在 Blender 中取消渲染，插件会向 server 发送取消请求，server 会尽快停止对应任务。
 
 也可以用命令行快速检查服务是否可用：
 
@@ -85,7 +85,7 @@ curl http://127.0.0.1:8080/health
 远程渲染接口：
 
 ```text
-POST /jobs?threads=8&direct_only=0
+POST /jobs?threads=8&direct_only=0&partial_update_rows=36
 Content-Type: application/json
 
 <Blender 插件导出的内部场景 JSON>
@@ -101,11 +101,12 @@ Content-Type: application/json
 
 ```text
 GET  /jobs/<job_id>/progress
+GET  /jobs/<job_id>/partial
 GET  /jobs/<job_id>/result
 POST /jobs/<job_id>/cancel
 ```
 
-`/result` 在任务完成后返回 `application/octet-stream`，内容是本项目的 `RTRGBAF1` RGBA32F 二进制图像。`POST /render` 作为同步调试接口仍保留，但 Blender 插件默认使用任务式接口。
+`/progress` 会返回任务状态、归一化进度和 `partial_seq`。当 `partial_seq` 变化时，`/partial` 返回当前最新的 `application/octet-stream` 预览图，内容同样是本项目的 `RTRGBAF1` RGBA32F 二进制图像；还没有预览时返回 `202 Accepted`。`/result` 在任务完成后返回最终图像。`POST /render` 作为同步调试接口仍保留，但 Blender 插件默认使用任务式接口。
 
 ## 参数说明
 
@@ -119,6 +120,7 @@ POST /jobs/<job_id>/cancel
 | `最大深度` | 光线递归反弹深度上限 |
 | `线程数` | 本次渲染请求让 C++ 渲染端使用的 CPU 线程数；远程模式下会随请求发给 server |
 | `仅直接光照` | 只计算相机射线、直接光照、阴影和环境光，不做递归随机反弹；适合快速预览 |
+| `渐进预览` | 渲染期间按已完成行批次刷新 Blender Render Result；本地 bridge 和远程 server 都支持，最终图像不受影响 |
 | `灯光强度倍率` | Blender 光照导出为 raytracer 内部光照强度前应用的倍率，默认 `0.03` |
 | `背景` | Blender 路径显式导出的背景。默认 `黑色`，也可选 `World 表面`、`自定义颜色` 或 raytracer 内置 `天空` |
 | `环境光` | 简单全局补光开关。默认关闭；开启后按 `环境光颜色 * 环境光强度 * 灯光强度倍率` 导出，环境光强度默认 `5.0` |
@@ -145,9 +147,10 @@ Blender 插件只承诺导出渲染核心已经支持或可以合理近似的内
 |--------------|----------|----------|------|
 | `F12` 最终渲染 | 当前 evaluated scene 的内部 JSON | bridge/server 调用共享 `render_scene()` | 不接管实时 viewport path tracing |
 | 本地后端 | `raytracer_blender_bridge` 子进程 | 读取 JSON，输出 `RTRGBAF1` RGBA32F | 插件把结果写回 Blender `Combined` pass |
-| 远程后端 | HTTP `POST /jobs` | server 后台渲染、轮询进度、下载结果 | 当前是 CPU 核心；CUDA/GPU 尚未实现 |
+| 远程后端 | HTTP `POST /jobs` | server 后台渲染、轮询进度/预览、下载结果 | 当前是 CPU 核心；CUDA/GPU 尚未实现 |
 | 取消渲染 | Blender `test_break()` | 本地终止子进程；远程发送 `/cancel` | server 会尽快停止对应任务 |
 | 进度条 | bridge stderr `PROGRESS` 或远程 progress API | Blender `update_progress()` | 不是逐采样进度，是按行/任务状态汇报 |
+| 渐进预览 | bridge stderr `PARTIAL` 或远程 `/partial` | Blender `begin_result()/end_result()` 刷新 `Combined` pass | 当前是按完成行批次更新，不是全屏逐 sample refinement |
 
 ### 相机与输出
 

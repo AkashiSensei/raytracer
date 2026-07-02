@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cmath>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -21,11 +22,7 @@ struct RenderOptions {
     bool stats = false;
     std::string stats_format = "text";
     int threads = 0;
-};
-
-struct RenderCallbacks {
-    std::function<void(double)> progress;
-    std::function<bool()> should_cancel;
+    int partial_update_rows = 0;
 };
 
 struct RenderOutput {
@@ -34,6 +31,12 @@ struct RenderOutput {
     int samples = 1;
     bool cancelled = false;
     std::vector<Color> pixels;
+};
+
+struct RenderCallbacks {
+    std::function<void(double)> progress;
+    std::function<void(const RenderOutput&, double)> partial;
+    std::function<bool()> should_cancel;
 };
 
 enum class RayPathType {
@@ -370,6 +373,12 @@ inline RenderOutput render_scene(const Scene& scene,
     std::atomic<int> rows_done{0};
     std::atomic<int> last_pct{-1};
     std::atomic<bool> cancelled{false};
+    std::mutex output_mutex;
+    std::mutex partial_mutex;
+    int partial_interval = options.partial_update_rows > 0
+        ? std::max(1, options.partial_update_rows)
+        : 0;
+    bool partial_enabled = callbacks.partial && partial_interval > 0;
 
     auto cancel_requested = [&]() {
         if (cancelled.load()) return true;
@@ -390,17 +399,41 @@ inline RenderOutput render_scene(const Scene& scene,
         }
     };
 
+    auto report_partial = [&](int done_rows) {
+        if (!partial_enabled || scene.height <= 0) return;
+        if (done_rows != scene.height && (done_rows % partial_interval) != 0) return;
+
+        std::lock_guard<std::mutex> partial_lock(partial_mutex);
+        RenderOutput snapshot;
+        {
+            std::lock_guard<std::mutex> output_lock(output_mutex);
+            snapshot = output;
+        }
+        callbacks.partial(snapshot, double(done_rows) / double(scene.height));
+    };
+
     auto render_worker = [&]() {
         while (!cancel_requested()) {
             int j = next_row.fetch_add(1);
             if (j >= scene.height) break;
 
             int sample_row = scene.height - 1 - j;
+            std::vector<Color> row_pixels;
+            if (partial_enabled) {
+                row_pixels.assign(static_cast<size_t>(scene.width), Color(0, 0, 0));
+            }
+            bool row_cancelled = false;
             for (int i = 0; i < scene.width; i++) {
-                if (cancel_requested()) break;
+                if (cancel_requested()) {
+                    row_cancelled = true;
+                    break;
+                }
                 Color col(0, 0, 0);
                 for (int s = 0; s < scene.samples; s++) {
-                    if ((s & 15) == 0 && cancel_requested()) break;
+                    if ((s & 15) == 0 && cancel_requested()) {
+                        row_cancelled = true;
+                        break;
+                    }
                     double offset_x = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
                     double offset_y = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
                     double u = (i + offset_x) / std::max(1, scene.width - 1);
@@ -409,13 +442,26 @@ inline RenderOutput render_scene(const Scene& scene,
                         scene.camera->get_ray(u, v), scene, scene.max_depth, options, infinity, false);
                     col += clamp_radiance(sample, scene.firefly_clamp);
                 }
-                output.pixels[static_cast<size_t>(j) * static_cast<size_t>(scene.width) +
-                              static_cast<size_t>(i)] = col;
+                if (row_cancelled) break;
+                if (partial_enabled) {
+                    row_pixels[static_cast<size_t>(i)] = col;
+                } else {
+                    output.pixels[static_cast<size_t>(j) * static_cast<size_t>(scene.width) +
+                                  static_cast<size_t>(i)] = col;
+                }
             }
 
-            if (cancelled.load()) break;
+            if (cancelled.load() || row_cancelled) break;
+            if (partial_enabled) {
+                std::lock_guard<std::mutex> lock(output_mutex);
+                std::copy(row_pixels.begin(),
+                          row_pixels.end(),
+                          output.pixels.begin() +
+                              static_cast<size_t>(j) * static_cast<size_t>(scene.width));
+            }
             int done = rows_done.fetch_add(1) + 1;
             report_progress(done);
+            report_partial(done);
         }
     };
 

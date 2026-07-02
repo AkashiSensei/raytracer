@@ -323,6 +323,43 @@ void test_environment_solid_and_gradient_backgrounds() {
           "gradient environment should vary with ray direction");
 }
 
+void test_render_scene_reports_partial_updates() {
+    {
+        std::ofstream out("/tmp/rt_partial_updates.json");
+        out << "{"
+            << "\"image\":{\"width\":8,\"height\":4,\"samples\":1,\"max_depth\":2},"
+            << "\"environment\":{\"type\":\"solid\",\"color\":[0.1,0.2,0.3]},"
+            << "\"objects\":[]"
+            << "}";
+    }
+
+    Scene scene;
+    load_scene("/tmp/rt_partial_updates.json", scene);
+
+    RenderOptions options;
+    options.threads = 1;
+    options.partial_update_rows = 2;
+
+    int partial_count = 0;
+    double last_progress = 0.0;
+    RenderCallbacks callbacks;
+    callbacks.partial = [&](const RenderOutput& partial, double progress) {
+        partial_count += 1;
+        last_progress = progress;
+        check(partial.width == scene.width && partial.height == scene.height,
+              "partial render output should preserve image dimensions");
+        check(partial.pixels.size() == static_cast<size_t>(scene.width) * static_cast<size_t>(scene.height),
+              "partial render output should preserve pixel buffer size");
+        check(progress > 0.0 && progress <= 1.0,
+              "partial render progress should be normalized");
+    };
+
+    RenderOutput output = render_scene(scene, options, callbacks);
+    check(!output.cancelled, "partial update test render should complete");
+    check(partial_count >= 2, "render_scene should emit partial updates at configured row intervals");
+    check(near(last_progress, 1.0), "final partial update should report full progress");
+}
+
 void test_extended_light_types_parse() {
     JsonValue rect;
     rect.type = JsonValue::Object;
@@ -1275,6 +1312,7 @@ int main() {
     test_display_color_exposure_and_tone_mapping();
     test_output_format_detection();
     test_environment_solid_and_gradient_backgrounds();
+    test_render_scene_reports_partial_updates();
     test_extended_light_types_parse();
     test_extended_light_sampling_outputs_radiance();
     test_analytic_area_light_visibility_for_camera_and_specular_rays();

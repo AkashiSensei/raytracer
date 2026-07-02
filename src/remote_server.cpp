@@ -63,6 +63,8 @@ struct RenderJob {
     bool failed = false;
     std::string error;
     std::vector<unsigned char> result;
+    std::vector<unsigned char> partial_result;
+    unsigned long long partial_seq = 0;
 };
 
 std::mutex g_jobs_mutex;
@@ -327,6 +329,8 @@ RenderOptions make_render_options(const std::map<std::string, std::string>& para
     requested_threads = query_int(params, "threads", args.default_threads);
     options.threads = apply_thread_limit(requested_threads, args);
     options.direct_only = query_bool(params, "direct_only", false);
+    options.partial_update_rows = query_int(params, "partial_update_rows", 0);
+    if (options.partial_update_rows < 0) options.partial_update_rows = 0;
     return options;
 }
 
@@ -341,6 +345,7 @@ std::vector<unsigned char> render_scene_body(const std::string& body,
                                              const std::map<std::string, std::string>& params,
                                              const ServerArgs& args,
                                              const std::function<void(double)>& on_progress,
+                                             const std::function<void(const RenderOutput&, double)>& on_partial,
                                              const std::function<bool()>& should_cancel) {
     Scene scene = load_scene_from_body(body);
     apply_scene_overrides(scene, params);
@@ -363,6 +368,7 @@ std::vector<unsigned char> render_scene_body(const std::string& body,
         std::cerr << "PROGRESS " << pct << "%\n" << std::flush;
         if (on_progress) on_progress(clamped);
     };
+    callbacks.partial = on_partial;
     callbacks.should_cancel = should_cancel;
 
     RenderOutput output = render_scene(scene, options, callbacks);
@@ -378,6 +384,7 @@ std::vector<unsigned char> render_request(const HttpRequest& request, const Serv
                              parse_query(request.query),
                              args,
                              std::function<void(double)>(),
+                             std::function<void(const RenderOutput&, double)>(),
                              std::function<bool()>());
 }
 
@@ -404,7 +411,8 @@ std::string job_status_json(const std::shared_ptr<RenderJob>& job) {
     std::ostringstream out;
     out << "{\"job_id\":\"" << json_escape(job->id) << "\","
         << "\"status\":\"" << status << "\","
-        << "\"progress\":" << std::clamp(job->progress, 0.0, 1.0);
+        << "\"progress\":" << std::clamp(job->progress, 0.0, 1.0) << ","
+        << "\"partial_seq\":" << job->partial_seq;
     if (job->failed) {
         out << ",\"error\":\"" << json_escape(job->error) << "\"";
     }
@@ -429,6 +437,17 @@ void run_job(std::shared_ptr<RenderJob> job,
             [job](double progress) {
                 std::lock_guard<std::mutex> lock(job->mutex);
                 job->progress = progress;
+            },
+            [job](const RenderOutput& partial, double progress) {
+                try {
+                    std::vector<unsigned char> bytes = encode_rgba32f(partial);
+                    std::lock_guard<std::mutex> lock(job->mutex);
+                    job->partial_result = std::move(bytes);
+                    job->partial_seq += 1;
+                    job->progress = std::max(job->progress, std::clamp(progress, 0.0, 1.0));
+                } catch (const std::exception& e) {
+                    std::cerr << "ERROR writing remote partial: " << e.what() << "\n";
+                }
             },
             [job]() {
                 return job->cancel_requested.load();
@@ -558,6 +577,35 @@ void handle_client(int client_fd, const ServerArgs& args) {
                     send_response(client_fd, 500, "Internal Server Error", "text/plain",
                                   text_body("error: " + error + "\n"));
                 } else if (status == "cancelled") {
+                    send_response(client_fd, 409, "Conflict", "text/plain",
+                                  text_body("job cancelled\n"));
+                } else {
+                    send_response(client_fd, 202, "Accepted", "application/json",
+                                  text_body(job_status_json(job)));
+                }
+            }
+        } else if (request.method == "GET" && !job_id_from_path(request.path, "/partial").empty()) {
+            std::string id = job_id_from_path(request.path, "/partial");
+            std::shared_ptr<RenderJob> job = find_job(id);
+            if (!job) {
+                send_response(client_fd, 404, "Not Found", "text/plain", text_body("job not found\n"));
+            } else {
+                std::vector<unsigned char> partial;
+                std::string error;
+                bool cancelled = false;
+                {
+                    std::lock_guard<std::mutex> lock(job->mutex);
+                    partial = job->partial_result;
+                    error = job->error;
+                    cancelled = job->cancelled;
+                }
+
+                if (!partial.empty()) {
+                    send_response(client_fd, 200, "OK", "application/octet-stream", partial);
+                } else if (!error.empty()) {
+                    send_response(client_fd, 500, "Internal Server Error", "text/plain",
+                                  text_body("error: " + error + "\n"));
+                } else if (cancelled) {
                     send_response(client_fd, 409, "Conflict", "text/plain",
                                   text_body("job cancelled\n"));
                 } else {

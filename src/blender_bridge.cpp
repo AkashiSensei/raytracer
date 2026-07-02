@@ -10,7 +10,10 @@
 #include <algorithm>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 namespace {
@@ -20,6 +23,7 @@ struct BridgeArgs {
     std::string out_float_path;
     int samples_override = -1;
     int max_depth_override = -1;
+    std::string partial_dir;
     RenderOptions render_options;
 };
 
@@ -30,6 +34,8 @@ void print_usage(const char* prog) {
               << "  --samples <n>        samples per pixel override\n"
               << "  --max-depth <n>      ray recursion depth override\n"
               << "  --threads <n>        render worker threads\n"
+              << "  --partial-dir <path> write progressive RGBA32F preview snapshots\n"
+              << "  --partial-update-rows <n> rows between progressive preview snapshots\n"
               << "  --direct-only        disable recursive random bounces\n"
               << "  --version            print bridge protocol version\n";
 }
@@ -45,6 +51,14 @@ bool parse_args(int argc, char* argv[], BridgeArgs& args) {
             args.samples_override = std::stoi(argv[++i]);
         } else if (arg == "--max-depth" && i + 1 < argc) {
             args.max_depth_override = std::stoi(argv[++i]);
+        } else if (arg == "--partial-dir" && i + 1 < argc) {
+            args.partial_dir = argv[++i];
+        } else if (arg == "--partial-update-rows" && i + 1 < argc) {
+            args.render_options.partial_update_rows = std::stoi(argv[++i]);
+            if (args.render_options.partial_update_rows <= 0) {
+                std::cerr << "--partial-update-rows must be greater than 0\n";
+                return false;
+            }
         } else if (arg == "--threads" && i + 1 < argc) {
             args.render_options.threads = std::stoi(argv[++i]);
             if (args.render_options.threads <= 0) {
@@ -91,6 +105,9 @@ int main(int argc, char* argv[]) {
 
     if (args.samples_override > 0) scene.samples = args.samples_override;
     if (args.max_depth_override > 0) scene.max_depth = args.max_depth_override;
+    if (!args.partial_dir.empty() && args.render_options.partial_update_rows <= 0) {
+        args.render_options.partial_update_rows = std::max(1, scene.height / 20);
+    }
 
     const char* environment_type = "gradient";
     if (scene.environment.type == EnvironmentType::Solid) environment_type = "solid";
@@ -112,6 +129,28 @@ int main(int argc, char* argv[]) {
         double clamped = std::clamp(progress, 0.0, 1.0);
         std::cerr << "PROGRESS " << clamped << "\n" << std::flush;
     };
+    if (!args.partial_dir.empty()) {
+        try {
+            std::filesystem::create_directories(args.partial_dir);
+        } catch (const std::exception& e) {
+            std::cerr << "ERROR creating partial directory: " << e.what() << "\n";
+            return 1;
+        }
+
+        int partial_seq = 0;
+        callbacks.partial = [&](const RenderOutput& partial, double progress) {
+            std::ostringstream name;
+            name << "partial_" << std::setw(6) << std::setfill('0') << (++partial_seq) << ".rgba32f";
+            std::filesystem::path partial_path = std::filesystem::path(args.partial_dir) / name.str();
+            try {
+                write_rgba32f(partial_path.string(), partial);
+                double clamped = std::clamp(progress, 0.0, 1.0);
+                std::cerr << "PARTIAL " << clamped << " " << partial_path.string() << "\n" << std::flush;
+            } catch (const std::exception& e) {
+                std::cerr << "ERROR writing partial result: " << e.what() << "\n" << std::flush;
+            }
+        };
+    }
 
     RenderOutput output = render_scene(scene, args.render_options, callbacks);
     if (output.cancelled) {
