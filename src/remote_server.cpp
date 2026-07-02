@@ -43,6 +43,8 @@ struct ServerArgs {
     size_t max_body_bytes = 512ull * 1024ull * 1024ull;
 };
 
+constexpr int kRemoteSamplePassBatch = 64;
+
 struct HttpRequest {
     std::string method;
     std::string target;
@@ -286,6 +288,17 @@ int query_int(const std::map<std::string, std::string>& params, const std::strin
     return std::stoi(it->second);
 }
 
+RenderSchedule query_render_schedule(const std::map<std::string, std::string>& params) {
+    auto it = params.find("render_schedule");
+    if (it == params.end() || it->second.empty()) return RenderSchedule::Rows;
+    std::string value = lower(it->second);
+    if (value == "sample-passes" || value == "sample_passes" ||
+        value == "sample-pass" || value == "sample_pass") {
+        return RenderSchedule::SamplePasses;
+    }
+    return RenderSchedule::Rows;
+}
+
 int apply_thread_limit(int requested_threads, const ServerArgs& args) {
     if (requested_threads > 0 && args.max_request_threads > 0) {
         return std::min(requested_threads, args.max_request_threads);
@@ -329,8 +342,11 @@ RenderOptions make_render_options(const std::map<std::string, std::string>& para
     requested_threads = query_int(params, "threads", args.default_threads);
     options.threads = apply_thread_limit(requested_threads, args);
     options.direct_only = query_bool(params, "direct_only", false);
-    options.partial_update_rows = query_int(params, "partial_update_rows", 0);
-    if (options.partial_update_rows < 0) options.partial_update_rows = 0;
+    options.schedule = query_render_schedule(params);
+    options.partial_update_interval = query_int(params, "partial_update_interval",
+                                                query_int(params, "partial_update_rows", 0));
+    if (options.partial_update_interval < 0) options.partial_update_interval = 0;
+    options.sample_pass_batch = kRemoteSamplePassBatch;
     return options;
 }
 
@@ -358,6 +374,8 @@ std::vector<unsigned char> render_scene_body(const std::string& body,
               << " threads=" << resolve_thread_count(scene, options)
               << " requested_threads=" << requested_threads
               << " max_request_threads=" << args.max_request_threads
+              << " schedule=" << render_schedule_name(options.schedule)
+              << " sample_pass_batch=" << options.sample_pass_batch
               << " direct_only=" << (options.direct_only ? "true" : "false")
               << " primitives=" << scene.primitive_count << "\n";
 

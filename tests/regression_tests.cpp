@@ -338,7 +338,7 @@ void test_render_scene_reports_partial_updates() {
 
     RenderOptions options;
     options.threads = 1;
-    options.partial_update_rows = 2;
+    options.partial_update_interval = 2;
 
     int partial_count = 0;
     double last_progress = 0.0;
@@ -358,6 +358,46 @@ void test_render_scene_reports_partial_updates() {
     check(!output.cancelled, "partial update test render should complete");
     check(partial_count >= 2, "render_scene should emit partial updates at configured row intervals");
     check(near(last_progress, 1.0), "final partial update should report full progress");
+}
+
+void test_render_scene_sample_pass_schedule_reports_accumulated_samples() {
+    {
+        std::ofstream out("/tmp/rt_sample_pass_updates.json");
+        out << "{"
+            << "\"image\":{\"width\":4,\"height\":3,\"samples\":4,\"max_depth\":2},"
+            << "\"environment\":{\"type\":\"solid\",\"color\":[0.2,0.3,0.4]},"
+            << "\"objects\":[]"
+            << "}";
+    }
+
+    Scene scene;
+    load_scene("/tmp/rt_sample_pass_updates.json", scene);
+
+    RenderOptions options;
+    options.threads = 1;
+    options.partial_update_interval = 2;
+    options.sample_pass_batch = 2;
+    options.schedule = RenderSchedule::SamplePasses;
+
+    int partial_count = 0;
+    int last_partial_samples = 0;
+    RenderCallbacks callbacks;
+    callbacks.partial = [&](const RenderOutput& partial, double progress) {
+        partial_count += 1;
+        last_partial_samples = partial.samples;
+        check(partial.width == scene.width && partial.height == scene.height,
+              "sample-pass partial output should preserve image dimensions");
+        check(partial.samples == 2 || partial.samples == 4,
+              "sample-pass partial output should report accumulated sample count");
+        check(progress > 0.0 && progress <= 1.0,
+              "sample-pass partial progress should be normalized");
+    };
+
+    RenderOutput output = render_scene(scene, options, callbacks);
+    check(!output.cancelled, "sample-pass schedule render should complete");
+    check(output.samples == scene.samples, "final sample-pass output should keep requested sample count");
+    check(partial_count == 2, "sample-pass schedule should emit partial updates at sample intervals");
+    check(last_partial_samples == scene.samples, "final sample-pass partial should use final sample count");
 }
 
 void test_extended_light_types_parse() {
@@ -1313,6 +1353,7 @@ int main() {
     test_output_format_detection();
     test_environment_solid_and_gradient_backgrounds();
     test_render_scene_reports_partial_updates();
+    test_render_scene_sample_pass_schedule_reports_accumulated_samples();
     test_extended_light_types_parse();
     test_extended_light_sampling_outputs_radiance();
     test_analytic_area_light_visibility_for_camera_and_specular_rays();

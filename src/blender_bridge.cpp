@@ -34,8 +34,10 @@ void print_usage(const char* prog) {
               << "  --samples <n>        samples per pixel override\n"
               << "  --max-depth <n>      ray recursion depth override\n"
               << "  --threads <n>        render worker threads\n"
+              << "  --render-schedule <rows|sample-passes> render ordering, default rows\n"
               << "  --partial-dir <path> write progressive RGBA32F preview snapshots\n"
-              << "  --partial-update-rows <n> rows between progressive preview snapshots\n"
+              << "  --partial-update-interval <n> rows or sample passes between preview snapshots\n"
+              << "  --partial-update-rows <n> compatibility alias for row preview interval\n"
               << "  --direct-only        disable recursive random bounces\n"
               << "  --version            print bridge protocol version\n";
 }
@@ -53,10 +55,21 @@ bool parse_args(int argc, char* argv[], BridgeArgs& args) {
             args.max_depth_override = std::stoi(argv[++i]);
         } else if (arg == "--partial-dir" && i + 1 < argc) {
             args.partial_dir = argv[++i];
-        } else if (arg == "--partial-update-rows" && i + 1 < argc) {
-            args.render_options.partial_update_rows = std::stoi(argv[++i]);
-            if (args.render_options.partial_update_rows <= 0) {
-                std::cerr << "--partial-update-rows must be greater than 0\n";
+        } else if (arg == "--render-schedule" && i + 1 < argc) {
+            std::string schedule = argv[++i];
+            if (schedule == "rows" || schedule == "row") {
+                args.render_options.schedule = RenderSchedule::Rows;
+            } else if (schedule == "sample-passes" || schedule == "sample_passes" ||
+                       schedule == "sample-pass" || schedule == "sample_pass") {
+                args.render_options.schedule = RenderSchedule::SamplePasses;
+            } else {
+                std::cerr << "--render-schedule must be rows or sample-passes\n";
+                return false;
+            }
+        } else if ((arg == "--partial-update-interval" || arg == "--partial-update-rows") && i + 1 < argc) {
+            args.render_options.partial_update_interval = std::stoi(argv[++i]);
+            if (args.render_options.partial_update_interval <= 0) {
+                std::cerr << arg << " must be greater than 0\n";
                 return false;
             }
         } else if (arg == "--threads" && i + 1 < argc) {
@@ -105,8 +118,11 @@ int main(int argc, char* argv[]) {
 
     if (args.samples_override > 0) scene.samples = args.samples_override;
     if (args.max_depth_override > 0) scene.max_depth = args.max_depth_override;
-    if (!args.partial_dir.empty() && args.render_options.partial_update_rows <= 0) {
-        args.render_options.partial_update_rows = std::max(1, scene.height / 20);
+    if (!args.partial_dir.empty() && args.render_options.partial_update_interval <= 0) {
+        int units = args.render_options.schedule == RenderSchedule::SamplePasses
+            ? scene.samples
+            : scene.height;
+        args.render_options.partial_update_interval = std::max(1, units / 20);
     }
 
     const char* environment_type = "gradient";
@@ -119,6 +135,8 @@ int main(int argc, char* argv[]) {
               << " depth=" << scene.max_depth
               << " primitives=" << scene.primitive_count
               << " lights=" << scene.lights.size()
+              << " schedule=" << render_schedule_name(args.render_options.schedule)
+              << " sample_pass_batch=" << args.render_options.sample_pass_batch
               << " ambient=(" << scene.ambient_light.x << ","
               << scene.ambient_light.y << "," << scene.ambient_light.z << ")"
               << " environment=" << environment_type

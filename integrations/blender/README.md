@@ -85,7 +85,7 @@ curl http://127.0.0.1:8080/health
 远程渲染接口：
 
 ```text
-POST /jobs?threads=8&direct_only=0&partial_update_rows=36
+POST /jobs?threads=8&direct_only=0&render_schedule=sample_passes&partial_update_interval=1
 Content-Type: application/json
 
 <Blender 插件导出的内部场景 JSON>
@@ -106,7 +106,7 @@ GET  /jobs/<job_id>/result
 POST /jobs/<job_id>/cancel
 ```
 
-`/progress` 会返回任务状态、归一化进度和 `partial_seq`。当 `partial_seq` 变化时，`/partial` 返回当前最新的 `application/octet-stream` 预览图，内容同样是本项目的 `RTRGBAF1` RGBA32F 二进制图像；还没有预览时返回 `202 Accepted`。`/result` 在任务完成后返回最终图像。`POST /render` 作为同步调试接口仍保留，但 Blender 插件默认使用任务式接口。
+`render_schedule` 可选 `rows` 或 `sample_passes`。`sample_passes` 的采样批次由后端固定选择：本地 bridge 为 `16`，远程 server 为 `64`。`partial_update_interval` 在 `rows` 下表示预览行批次间隔，在 `sample_passes` 下表示 sample 间隔；旧的 `partial_update_rows` 仍作为兼容别名。`/progress` 会返回任务状态、归一化进度和 `partial_seq`。当 `partial_seq` 变化时，`/partial` 返回当前最新的 `application/octet-stream` 预览图，内容同样是本项目的 `RTRGBAF1` RGBA32F 二进制图像；还没有预览时返回 `202 Accepted`。`/result` 在任务完成后返回最终图像。`POST /render` 作为同步调试接口仍保留，但 Blender 插件默认使用任务式接口。
 
 ## 参数说明
 
@@ -120,7 +120,8 @@ POST /jobs/<job_id>/cancel
 | `最大深度` | 光线递归反弹深度上限 |
 | `线程数` | 本次渲染请求让 C++ 渲染端使用的 CPU 线程数；远程模式下会随请求发给 server |
 | `仅直接光照` | 只计算相机射线、直接光照、阴影和环境光，不做递归随机反弹；适合快速预览 |
-| `渐进预览` | 渲染期间按已完成行批次刷新 Blender Render Result；本地 bridge 和远程 server 都支持，最终图像不受影响 |
+| `采样调度` | 控制渲染任务顺序。`按行完成` 会先完成一批像素行，`全图累积` 会每轮给整张图增加采样，更接近 Cycles 的渐进预览 |
+| `渐进预览` | 渲染期间刷新 Blender Render Result；本地 bridge 和远程 server 都支持，最终图像不受影响 |
 | `灯光强度倍率` | Blender 光照导出为 raytracer 内部光照强度前应用的倍率，默认 `0.03` |
 | `背景` | Blender 路径显式导出的背景。默认 `黑色`，也可选 `World 表面`、`自定义颜色` 或 raytracer 内置 `天空` |
 | `环境光` | 简单全局补光开关。默认关闭；开启后按 `环境光颜色 * 环境光强度 * 灯光强度倍率` 导出，环境光强度默认 `5.0` |
@@ -150,7 +151,7 @@ Blender 插件只承诺导出渲染核心已经支持或可以合理近似的内
 | 远程后端 | HTTP `POST /jobs` | server 后台渲染、轮询进度/预览、下载结果 | 当前是 CPU 核心；CUDA/GPU 尚未实现 |
 | 取消渲染 | Blender `test_break()` | 本地终止子进程；远程发送 `/cancel` | server 会尽快停止对应任务 |
 | 进度条 | bridge stderr `PROGRESS` 或远程 progress API | Blender `update_progress()` | 不是逐采样进度，是按行/任务状态汇报 |
-| 渐进预览 | bridge stderr `PARTIAL` 或远程 `/partial` | Blender `begin_result()/end_result()` 刷新 `Combined` pass | 当前是按完成行批次更新，不是全屏逐 sample refinement |
+| 渐进预览 | bridge stderr `PARTIAL` 或远程 `/partial` | Blender `begin_result()/end_result()` 刷新 `Combined` pass | `按行完成` 为行级填充；`全图累积` 按采样批次进行全画面降噪 |
 
 ### 相机与输出
 

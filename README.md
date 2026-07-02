@@ -618,7 +618,7 @@ raytracer/
 - ✅ Blender 解析光源导出：Point / Sun / Spot，以及 Area Light 的 rect / disk 面光源采样；Area 默认相机不可见、specular/glossy 可见，并提供“面光源相机可见”插件选项
 - ✅ Blender 材质贴图导出：Principled BSDF 的基础色 / 金属度 / 糙度支持 Checker、Image、Noise、ColorRamp、Math、Mix、Invert、Map Range、RGB/Value 等常见节点，并导出 Mapping 的 scale / offset / rotation
 - ✅ Blender 贴图坐标与诊断：导出 active UV，支持 Generated/Object 近似坐标，记录 unsupported texture 节点和混合坐标诊断，并提供 `scripts/inspect_texture_export.py` 检查调试缓存
-- ✅ Blender 渐进预览：本地 bridge 通过 `PARTIAL` RGBA32F 快照、远程 server 通过 `/jobs/<id>/partial` 和 `partial_seq` 逐步刷新 Render Result；当前按已完成行批次更新，最终图像路径不变
+- ✅ Blender 渐进预览与采样调度：本地 bridge 通过 `PARTIAL` RGBA32F 快照、远程 server 通过 `/jobs/<id>/partial` 和 `partial_seq` 逐步刷新 Render Result；支持按行完成和全图 sample batch 累积两种顺序，本地默认 batch 16、远程默认 batch 64，最终图像路径不变
 - ✅ 性能 profiling：`--stats-format json` + `scripts/benchmark_report.py`（CSV/JSON/MD，分类定位透明/网格重瓶颈）
 - ✅ 渲染质量自动报告：`scripts/render_report.py`（批量渲染 → PNG 校验 → contact sheet → markdown 验收报告）+ `scripts/html_report.py`（自包含 HTML 报告 + 高清原图 modal 灯箱）
 - ✅ Golden 回归覆盖扩展：default、mirror_glass_water、Khronos WaterBottle/CompareMetallic/Attenuation/CompareRoughness/TransmissionRoughness、OBJ MTL、扩展 MTL、glass_emissive、bunny、no-normal OBJ、studio_materials

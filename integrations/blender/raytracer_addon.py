@@ -917,8 +917,15 @@ class RendererClient:
         raise NotImplementedError
 
 
-def progressive_update_rows(package):
-    height = int(package.get("image", {}).get("height", 1))
+def render_schedule_protocol(settings):
+    return "sample_passes" if settings.render_schedule == "SAMPLE_PASSES" else "rows"
+
+
+def progressive_update_interval(package, settings):
+    image = package.get("image", {})
+    if settings.render_schedule == "SAMPLE_PASSES":
+        return 1 if settings.backend == "REMOTE" else 16
+    height = int(image.get("height", 1))
     return max(1, height // 20)
 
 
@@ -938,12 +945,13 @@ class LocalSubprocessRenderer(RendererClient):
             "--scene", str(scene_path),
             "--out-float", str(result_path),
             "--threads", str(max(1, int(settings.threads))),
+            "--render-schedule", render_schedule_protocol(settings),
         ]
         if settings.progressive_preview:
             partial_dir = Path(work_dir) / "partials"
             cmd.extend([
                 "--partial-dir", str(partial_dir),
-                "--partial-update-rows", str(progressive_update_rows(package)),
+                "--partial-update-interval", str(progressive_update_interval(package, settings)),
             ])
         if settings.direct_only:
             cmd.append("--direct-only")
@@ -1060,9 +1068,10 @@ class RemoteHttpRenderer(RendererClient):
         render_params = {
             "threads": max(1, int(settings.threads)),
             "direct_only": "1" if settings.direct_only else "0",
+            "render_schedule": render_schedule_protocol(settings),
         }
         if settings.progressive_preview:
-            render_params["partial_update_rows"] = progressive_update_rows(package)
+            render_params["partial_update_interval"] = progressive_update_interval(package, settings)
         params = urllib.parse.urlencode(render_params)
         write_debug_text(debug_cache, "remote_request.txt", self.url("/jobs") + "?" + params + "\n")
 
@@ -1217,6 +1226,15 @@ class RaytracerSettings(bpy.types.PropertyGroup):
     max_depth: IntProperty(name="最大深度", default=16, min=1, max=256)
     threads: IntProperty(name="线程数", default=8, min=1, max=128)
     direct_only: BoolProperty(name="仅直接光照", default=False)
+    render_schedule: EnumProperty(
+        name="采样调度",
+        items=[
+            ("ROWS", "按行完成", "完成一批像素行后刷新预览；最终像素在写入前已完成全部采样"),
+            ("SAMPLE_PASSES", "全图累积", "每轮给整张图增加部分采样，预览会逐步降噪"),
+        ],
+        default="ROWS",
+        description="控制渲染任务的采样顺序；全图累积更接近 Cycles 的渐进预览",
+    )
     progressive_preview: BoolProperty(
         name="渐进预览",
         default=True,
@@ -1328,6 +1346,7 @@ class RENDER_PT_raytracer_settings(bpy.types.Panel):
         render_box.prop(settings, "max_depth")
         render_box.prop(settings, "threads")
         render_box.prop(settings, "direct_only")
+        render_box.prop(settings, "render_schedule")
         render_box.prop(settings, "progressive_preview")
 
         lighting_box = layout.box()
