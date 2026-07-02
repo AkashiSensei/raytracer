@@ -974,6 +974,11 @@ class LocalSubprocessRenderer(RendererClient):
                             engine.update_progress(float(line.split()[1]))
                         except (IndexError, ValueError):
                             pass
+                    elif line.startswith("STATUS "):
+                        try:
+                            engine.update_render_status(json.loads(line[len("STATUS "):]))
+                        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                            stderr_lines.append("STATUS parse failed: " + str(exc))
                     elif line.startswith("PARTIAL "):
                         try:
                             parts = line.split(" ", 2)
@@ -1114,6 +1119,7 @@ class RemoteHttpRenderer(RendererClient):
             state = status.get("status", "unknown")
             progress = float(status.get("progress", 0.0))
             engine.update_progress(max(0.0, min(0.98, progress)))
+            engine.update_render_status(status)
             progress_lines.append(json.dumps(status, separators=(",", ":")))
             write_debug_text(debug_cache, "remote_progress.log", "\n".join(progress_lines) + "\n")
 
@@ -1180,6 +1186,22 @@ def parse_rgba32f(data):
 def read_rgba32f(path):
     with open(path, "rb") as f:
         return parse_rgba32f(f.read())
+
+
+def format_duration(seconds):
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return "--:--"
+    if value < 0:
+        return "--:--"
+    total = int(value + 0.5)
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    if hours > 0:
+        return "%d:%02d:%02d" % (hours, minutes, secs)
+    return "%02d:%02d" % (minutes, secs)
 
 
 def default_bridge_path():
@@ -1296,6 +1318,8 @@ class RaytracerRenderEngine(bpy.types.RenderEngine):
         scene = depsgraph.scene
         settings = scene.raytracer_settings
         try:
+            self._raytracer_frame = int(scene.frame_current)
+            self._raytracer_last_status = None
             package = export_scene_package(scene, depsgraph, settings)
             debug_cache = create_debug_cache(settings)
             write_debug_json(debug_cache, "scene.rt.json", package)
@@ -1316,6 +1340,33 @@ class RaytracerRenderEngine(bpy.types.RenderEngine):
         layer = result.layers[0].passes["Combined"]
         layer.rect = pixels.blender_rect()
         self.end_result(result)
+        if getattr(self, "_raytracer_last_status", None):
+            self.update_render_status(self._raytracer_last_status)
+
+    def update_render_status(self, status):
+        self._raytracer_last_status = status
+        schedule = status.get("render_schedule", status.get("schedule", "rows"))
+        frame = int(getattr(self, "_raytracer_frame", 1))
+        elapsed = format_duration(status.get("elapsed_seconds", -1))
+        remaining = format_duration(status.get("remaining_seconds", -1))
+        if schedule == "sample_passes":
+            done = int(status.get("samples_done", 0))
+            total = int(status.get("samples_total", 0))
+            detail = "Sample %d/%d" % (done, total)
+        else:
+            done = int(status.get("pixels_done", 0))
+            total = int(status.get("pixels_total", 0))
+            if done <= 0 or total <= 0:
+                done = int(status.get("rows_done", 0))
+                total = int(status.get("rows_total", 0))
+                detail = "Rows %d/%d" % (done, total)
+            else:
+                detail = "Pixels %d/%d" % (done, total)
+        stats = "Frame:%d | Time:%s | Remaining:%s" % (frame, elapsed, remaining)
+        try:
+            self.update_stats(stats, detail)
+        except Exception:
+            pass
 
 
 class RENDER_PT_raytracer_settings(bpy.types.Panel):

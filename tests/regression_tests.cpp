@@ -341,8 +341,18 @@ void test_render_scene_reports_partial_updates() {
     options.partial_update_interval = 2;
 
     int partial_count = 0;
+    int status_count = 0;
+    long long last_pixels_done = 0;
     double last_progress = 0.0;
     RenderCallbacks callbacks;
+    callbacks.status = [&](const RenderProgressInfo& info) {
+        status_count += 1;
+        last_pixels_done = info.pixels_done;
+        check(info.schedule == RenderSchedule::Rows, "row schedule status should identify row scheduling");
+        check(info.pixels_total == static_cast<long long>(scene.width) * static_cast<long long>(scene.height),
+              "row schedule status should report total pixels");
+        check(info.elapsed_seconds >= 0.0, "row schedule status should report elapsed seconds");
+    };
     callbacks.partial = [&](const RenderOutput& partial, double progress) {
         partial_count += 1;
         last_progress = progress;
@@ -356,7 +366,11 @@ void test_render_scene_reports_partial_updates() {
 
     RenderOutput output = render_scene(scene, options, callbacks);
     check(!output.cancelled, "partial update test render should complete");
+    check(status_count > 0, "render_scene should emit row schedule status updates");
+    check(last_pixels_done == static_cast<long long>(scene.width) * static_cast<long long>(scene.height),
+          "final row schedule status should report all pixels complete");
     check(partial_count >= 2, "render_scene should emit partial updates at configured row intervals");
+    check(status_count >= partial_count, "row schedule should emit status for each partial update");
     check(near(last_progress, 1.0), "final partial update should report full progress");
 }
 
@@ -380,8 +394,20 @@ void test_render_scene_sample_pass_schedule_reports_accumulated_samples() {
     options.schedule = RenderSchedule::SamplePasses;
 
     int partial_count = 0;
+    int status_count = 0;
+    int last_status_samples = 0;
     int last_partial_samples = 0;
     RenderCallbacks callbacks;
+    callbacks.status = [&](const RenderProgressInfo& info) {
+        status_count += 1;
+        last_status_samples = info.samples_done;
+        check(info.schedule == RenderSchedule::SamplePasses,
+              "sample-pass status should identify sample-pass scheduling");
+        check(info.samples_total == scene.samples,
+              "sample-pass status should report total samples");
+        check(info.elapsed_seconds >= 0.0,
+              "sample-pass status should report elapsed seconds");
+    };
     callbacks.partial = [&](const RenderOutput& partial, double progress) {
         partial_count += 1;
         last_partial_samples = partial.samples;
@@ -396,7 +422,10 @@ void test_render_scene_sample_pass_schedule_reports_accumulated_samples() {
     RenderOutput output = render_scene(scene, options, callbacks);
     check(!output.cancelled, "sample-pass schedule render should complete");
     check(output.samples == scene.samples, "final sample-pass output should keep requested sample count");
+    check(status_count > 0, "sample-pass schedule should emit status updates");
+    check(last_status_samples == scene.samples, "final sample-pass status should report all samples complete");
     check(partial_count == 2, "sample-pass schedule should emit partial updates at sample intervals");
+    check(status_count >= partial_count, "sample-pass schedule should emit status for each partial update");
     check(last_partial_samples == scene.samples, "final sample-pass partial should use final sample count");
 }
 

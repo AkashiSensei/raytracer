@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
 
@@ -99,6 +100,23 @@ bool parse_args(int argc, char* argv[], BridgeArgs& args) {
     return true;
 }
 
+std::string status_json(const RenderProgressInfo& info) {
+    std::ostringstream out;
+    out << "{"
+        << "\"schedule\":\"" << render_schedule_name(info.schedule) << "\","
+        << "\"progress\":" << std::clamp(info.progress, 0.0, 1.0) << ","
+        << "\"samples_done\":" << info.samples_done << ","
+        << "\"samples_total\":" << info.samples_total << ","
+        << "\"rows_done\":" << info.rows_done << ","
+        << "\"rows_total\":" << info.rows_total << ","
+        << "\"pixels_done\":" << info.pixels_done << ","
+        << "\"pixels_total\":" << info.pixels_total << ","
+        << "\"elapsed_seconds\":" << info.elapsed_seconds << ","
+        << "\"remaining_seconds\":" << info.remaining_seconds
+        << "}";
+    return out.str();
+}
+
 }  // namespace
 
 int main(int argc, char* argv[]) {
@@ -142,10 +160,16 @@ int main(int argc, char* argv[]) {
               << " environment=" << environment_type
               << "\n";
 
+    std::mutex log_mutex;
     RenderCallbacks callbacks;
-    callbacks.progress = [](double progress) {
+    callbacks.progress = [&](double progress) {
         double clamped = std::clamp(progress, 0.0, 1.0);
+        std::lock_guard<std::mutex> lock(log_mutex);
         std::cerr << "PROGRESS " << clamped << "\n" << std::flush;
+    };
+    callbacks.status = [&](const RenderProgressInfo& info) {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        std::cerr << "STATUS " << status_json(info) << "\n" << std::flush;
     };
     if (!args.partial_dir.empty()) {
         try {
@@ -163,8 +187,10 @@ int main(int argc, char* argv[]) {
             try {
                 write_rgba32f(partial_path.string(), partial);
                 double clamped = std::clamp(progress, 0.0, 1.0);
+                std::lock_guard<std::mutex> lock(log_mutex);
                 std::cerr << "PARTIAL " << clamped << " " << partial_path.string() << "\n" << std::flush;
             } catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lock(log_mutex);
                 std::cerr << "ERROR writing partial result: " << e.what() << "\n" << std::flush;
             }
         };

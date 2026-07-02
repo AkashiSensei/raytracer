@@ -106,7 +106,7 @@ GET  /jobs/<job_id>/result
 POST /jobs/<job_id>/cancel
 ```
 
-`render_schedule` 可选 `rows` 或 `sample_passes`。`sample_passes` 的采样批次由后端固定选择：本地 bridge 为 `16`，远程 server 为 `64`。`partial_update_interval` 在 `rows` 下表示预览行批次间隔，在 `sample_passes` 下表示 sample 间隔；旧的 `partial_update_rows` 仍作为兼容别名。`/progress` 会返回任务状态、归一化进度和 `partial_seq`。当 `partial_seq` 变化时，`/partial` 返回当前最新的 `application/octet-stream` 预览图，内容同样是本项目的 `RTRGBAF1` RGBA32F 二进制图像；还没有预览时返回 `202 Accepted`。`/result` 在任务完成后返回最终图像。`POST /render` 作为同步调试接口仍保留，但 Blender 插件默认使用任务式接口。
+`render_schedule` 可选 `rows` 或 `sample_passes`。`sample_passes` 的采样批次由后端固定选择：本地 bridge 为 `16`，远程 server 为 `64`。`partial_update_interval` 在 `rows` 下表示预览行批次间隔，在 `sample_passes` 下表示 sample 间隔；旧的 `partial_update_rows` 仍作为兼容别名。`/progress` 会返回任务状态、归一化进度、`partial_seq`、当前调度的 samples/rows/pixels 计数，以及 elapsed/remaining 秒数。当 `partial_seq` 变化时，`/partial` 返回当前最新的 `application/octet-stream` 预览图，内容同样是本项目的 `RTRGBAF1` RGBA32F 二进制图像；还没有预览时返回 `202 Accepted`。`/result` 在任务完成后返回最终图像。`POST /render` 作为同步调试接口仍保留，但 Blender 插件默认使用任务式接口。
 
 ## 参数说明
 
@@ -151,6 +151,7 @@ Blender 插件只承诺导出渲染核心已经支持或可以合理近似的内
 | 远程后端 | HTTP `POST /jobs` | server 后台渲染、轮询进度/预览、下载结果 | 当前是 CPU 核心；CUDA/GPU 尚未实现 |
 | 取消渲染 | Blender `test_break()` | 本地终止子进程；远程发送 `/cancel` | server 会尽快停止对应任务 |
 | 进度条 | bridge stderr `PROGRESS` 或远程 progress API | Blender `update_progress()` | 不是逐采样进度，是按行/任务状态汇报 |
+| 渲染状态 | bridge stderr `STATUS` 或远程 progress API | Blender `update_stats()` | `按行完成` 显示 Pixels，`全图累积` 显示 Samples，并附带 elapsed/remaining |
 | 渐进预览 | bridge stderr `PARTIAL` 或远程 `/partial` | Blender `begin_result()/end_result()` 刷新 `Combined` pass | `按行完成` 为行级填充；`全图累积` 按采样批次进行全画面降噪 |
 
 ### 相机与输出

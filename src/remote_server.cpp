@@ -67,6 +67,8 @@ struct RenderJob {
     std::vector<unsigned char> result;
     std::vector<unsigned char> partial_result;
     unsigned long long partial_seq = 0;
+    RenderProgressInfo render_status;
+    bool has_render_status = false;
 };
 
 std::mutex g_jobs_mutex;
@@ -361,6 +363,7 @@ std::vector<unsigned char> render_scene_body(const std::string& body,
                                              const std::map<std::string, std::string>& params,
                                              const ServerArgs& args,
                                              const std::function<void(double)>& on_progress,
+                                             const std::function<void(const RenderProgressInfo&)>& on_status,
                                              const std::function<void(const RenderOutput&, double)>& on_partial,
                                              const std::function<bool()>& should_cancel) {
     Scene scene = load_scene_from_body(body);
@@ -386,6 +389,7 @@ std::vector<unsigned char> render_scene_body(const std::string& body,
         std::cerr << "PROGRESS " << pct << "%\n" << std::flush;
         if (on_progress) on_progress(clamped);
     };
+    callbacks.status = on_status;
     callbacks.partial = on_partial;
     callbacks.should_cancel = should_cancel;
 
@@ -402,6 +406,7 @@ std::vector<unsigned char> render_request(const HttpRequest& request, const Serv
                              parse_query(request.query),
                              args,
                              std::function<void(double)>(),
+                             std::function<void(const RenderProgressInfo&)>(),
                              std::function<void(const RenderOutput&, double)>(),
                              std::function<bool()>());
 }
@@ -431,6 +436,18 @@ std::string job_status_json(const std::shared_ptr<RenderJob>& job) {
         << "\"status\":\"" << status << "\","
         << "\"progress\":" << std::clamp(job->progress, 0.0, 1.0) << ","
         << "\"partial_seq\":" << job->partial_seq;
+    if (job->has_render_status) {
+        const RenderProgressInfo& info = job->render_status;
+        out << ",\"render_schedule\":\"" << render_schedule_name(info.schedule) << "\""
+            << ",\"samples_done\":" << info.samples_done
+            << ",\"samples_total\":" << info.samples_total
+            << ",\"rows_done\":" << info.rows_done
+            << ",\"rows_total\":" << info.rows_total
+            << ",\"pixels_done\":" << info.pixels_done
+            << ",\"pixels_total\":" << info.pixels_total
+            << ",\"elapsed_seconds\":" << info.elapsed_seconds
+            << ",\"remaining_seconds\":" << info.remaining_seconds;
+    }
     if (job->failed) {
         out << ",\"error\":\"" << json_escape(job->error) << "\"";
     }
@@ -455,6 +472,12 @@ void run_job(std::shared_ptr<RenderJob> job,
             [job](double progress) {
                 std::lock_guard<std::mutex> lock(job->mutex);
                 job->progress = progress;
+            },
+            [job](const RenderProgressInfo& info) {
+                std::lock_guard<std::mutex> lock(job->mutex);
+                job->render_status = info;
+                job->has_render_status = true;
+                job->progress = std::max(job->progress, std::clamp(info.progress, 0.0, 1.0));
             },
             [job](const RenderOutput& partial, double progress) {
                 try {

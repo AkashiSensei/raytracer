@@ -9,6 +9,7 @@
 #include "raytracer/scene/scene.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <functional>
 #include <mutex>
@@ -40,8 +41,22 @@ struct RenderOutput {
     std::vector<Color> pixels;
 };
 
+struct RenderProgressInfo {
+    RenderSchedule schedule = RenderSchedule::Rows;
+    double progress = 0.0;
+    int samples_done = 0;
+    int samples_total = 0;
+    int rows_done = 0;
+    int rows_total = 0;
+    long long pixels_done = 0;
+    long long pixels_total = 0;
+    double elapsed_seconds = 0.0;
+    double remaining_seconds = -1.0;
+};
+
 struct RenderCallbacks {
     std::function<void(double)> progress;
+    std::function<void(const RenderProgressInfo&)> status;
     std::function<void(const RenderOutput&, double)> partial;
     std::function<bool()> should_cancel;
 };
@@ -379,11 +394,16 @@ inline RenderOutput render_scene(const Scene& scene,
     output.pixels.assign(static_cast<size_t>(scene.width) * static_cast<size_t>(scene.height),
                          Color(0, 0, 0));
 
+    auto render_start_time = std::chrono::steady_clock::now();
     int thread_count = resolve_thread_count(scene, options);
-    std::atomic<int> last_pct{-1};
     std::atomic<bool> cancelled{false};
     std::mutex output_mutex;
     std::mutex partial_mutex;
+    std::mutex progress_mutex;
+    int last_status_done_units = -1;
+    int last_status_percent = -1;
+    auto last_status_time = render_start_time;
+    const auto progress_status_interval = std::chrono::seconds(3);
     int partial_interval = options.partial_update_interval > 0
         ? std::max(1, options.partial_update_interval)
         : 0;
@@ -398,14 +418,62 @@ inline RenderOutput render_scene(const Scene& scene,
         return false;
     };
 
-    auto report_progress = [&](int done_units, int total_units) {
-        if (!callbacks.progress || total_units <= 0) return;
-        int pct = 100 * done_units / total_units;
-        int previous = last_pct.load();
-        if ((pct % 5 == 0 || done_units == total_units) && pct != previous &&
-            last_pct.compare_exchange_strong(previous, pct)) {
-            callbacks.progress(double(done_units) / double(total_units));
+    auto make_progress_info = [&](int done_units, int total_units) {
+        RenderProgressInfo info;
+        info.schedule = options.schedule;
+        info.progress = total_units > 0 ? double(done_units) / double(total_units) : 0.0;
+        info.samples_total = scene.samples;
+        info.rows_total = scene.height;
+        info.pixels_total = static_cast<long long>(scene.width) * static_cast<long long>(scene.height);
+        if (options.schedule == RenderSchedule::SamplePasses) {
+            info.samples_done = std::min(done_units, scene.samples);
+            info.rows_done = scene.height;
+            info.pixels_done = info.pixels_total;
+        } else {
+            info.samples_done = scene.samples;
+            info.rows_done = std::min(done_units, scene.height);
+            info.pixels_done = static_cast<long long>(info.rows_done) * static_cast<long long>(scene.width);
         }
+
+        auto now = std::chrono::steady_clock::now();
+        info.elapsed_seconds = std::chrono::duration<double>(now - render_start_time).count();
+        if (info.progress > 1e-6 && info.progress < 1.0) {
+            info.remaining_seconds = info.elapsed_seconds * (1.0 - info.progress) / info.progress;
+        } else if (info.progress >= 1.0) {
+            info.remaining_seconds = 0.0;
+        }
+        return info;
+    };
+
+    auto report_progress_info = [&](const RenderProgressInfo& info, int done_units, bool force) {
+        if (!callbacks.progress && !callbacks.status) return;
+        int pct = std::max(0, std::min(100, static_cast<int>(info.progress * 100.0)));
+        bool should_report = false;
+        {
+            std::lock_guard<std::mutex> lock(progress_mutex);
+            auto now = std::chrono::steady_clock::now();
+            bool same_done_units = done_units == last_status_done_units;
+            bool percent_advanced = pct > last_status_percent;
+            bool interval_elapsed = now - last_status_time >= progress_status_interval;
+            bool complete = info.progress >= 1.0;
+            should_report = force || percent_advanced || interval_elapsed ||
+                (complete && !same_done_units);
+            if (should_report) {
+                last_status_done_units = done_units;
+                last_status_percent = pct;
+                last_status_time = now;
+            }
+        }
+        if (should_report) {
+            if (callbacks.progress) callbacks.progress(info.progress);
+            if (callbacks.status) callbacks.status(info);
+        }
+    };
+
+    auto report_progress = [&](int done_units, int total_units, bool force) {
+        if (total_units <= 0) return;
+        RenderProgressInfo info = make_progress_info(done_units, total_units);
+        report_progress_info(info, done_units, force);
     };
 
     auto report_partial = [&](double progress, int samples_done) {
@@ -477,7 +545,7 @@ inline RenderOutput render_scene(const Scene& scene,
                                   static_cast<size_t>(j) * static_cast<size_t>(scene.width));
                 }
                 int done = rows_done.fetch_add(1) + 1;
-                report_progress(done, scene.height);
+                report_progress(done, scene.height, false);
                 maybe_report_partial(done);
             }
         };
@@ -523,6 +591,7 @@ inline RenderOutput render_scene(const Scene& scene,
                         output.pixels[static_cast<size_t>(j) * static_cast<size_t>(scene.width) +
                                       static_cast<size_t>(i)] += col;
                     }
+                    if (!cancelled.load()) report_progress(sample_start, scene.samples, false);
                 }
             };
 
@@ -537,7 +606,7 @@ inline RenderOutput render_scene(const Scene& scene,
 
             if (cancelled.load()) break;
             int samples_done = sample_start + samples_this_pass;
-            report_progress(samples_done, scene.samples);
+            report_progress(samples_done, scene.samples, false);
             if (partial_enabled &&
                 (samples_done == scene.samples || samples_done - last_partial_samples >= partial_interval)) {
                 report_partial(double(samples_done) / double(scene.samples), samples_done);
@@ -553,7 +622,10 @@ inline RenderOutput render_scene(const Scene& scene,
     }
 
     output.cancelled = cancelled.load();
-    if (!output.cancelled && callbacks.progress) callbacks.progress(1.0);
+    if (!output.cancelled) {
+        int total_units = options.schedule == RenderSchedule::SamplePasses ? scene.samples : scene.height;
+        report_progress(total_units, total_units, false);
+    }
     return output;
 }
 
