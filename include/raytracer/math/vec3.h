@@ -59,6 +59,40 @@ inline Vec3 random_unit_vector() {
     return random_in_unit_sphere().normalized();
 }
 
+inline Vec3 random_cosine_direction(const Vec3& normal) {
+    Vec3 w = normal;
+    double w_len2 = w.length_squared();
+    if (w_len2 <= 1e-12) {
+        w = Vec3(0, 1, 0);
+    } else {
+        w /= std::sqrt(w_len2);
+    }
+
+    Vec3 a = std::fabs(w.x) > 0.9 ? Vec3(0, 1, 0) : Vec3(1, 0, 0);
+    Vec3 v = cross(w, a);
+    double v_len2 = v.length_squared();
+    if (v_len2 <= 1e-12) {
+        a = std::fabs(w.y) > 0.9 ? Vec3(0, 0, 1) : Vec3(0, 1, 0);
+        v = cross(w, a);
+        v_len2 = v.length_squared();
+    }
+    if (v_len2 <= 1e-12) {
+        v = Vec3(1, 0, 0);
+    } else {
+        v /= std::sqrt(v_len2);
+    }
+    Vec3 u = cross(v, w);
+
+    double r1 = random_double();
+    double r2 = random_double();
+    double phi = 2.0 * pi * r1;
+    double radius = std::sqrt(r2);
+    double x = radius * std::cos(phi);
+    double y = radius * std::sin(phi);
+    double z = std::sqrt(1.0 - r2);
+    return u * x + v * y + w * z;
+}
+
 inline Vec3 random_in_unit_disk() {
     while (true) {
         Vec3 p(random_double(-1,1), random_double(-1,1), 0);

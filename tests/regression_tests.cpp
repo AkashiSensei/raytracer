@@ -270,6 +270,35 @@ void test_pbr_exposes_brdf_and_pdf_for_direct_lighting() {
     check(finite_vec(brdf) && positive_color(brdf), "PBR BRDF should be finite and positive for a lit direction");
 }
 
+void test_lambertian_scatter_matches_cosine_pdf_contract() {
+    set_random_seed(9001);
+    Lambertian lambert(Color(0.6, 0.7, 0.8));
+
+    HitRecord rec;
+    rec.p = Point3(0, 0, 0);
+    rec.normal = Vec3(0, 1, 0);
+    rec.u = 0.25;
+    rec.v = 0.75;
+
+    Ray incoming(Point3(0, 1, 0), Vec3(0, -1, 0));
+    for (int i = 0; i < 32; i++) {
+        Color attenuation, emission;
+        Ray scattered;
+        bool did_scatter = lambert.scatter(incoming, rec, attenuation, scattered, emission);
+        check(did_scatter, "Lambertian scatter should produce an outgoing ray");
+        check(near(scattered.direction.length(), 1.0, 1e-9),
+              "Lambertian scatter should return a unit direction for cosine PDF evaluation");
+        double cos_theta = dot(rec.normal, scattered.direction);
+        check(cos_theta > 0.0, "Lambertian scatter should stay above the geometric surface");
+        check(near(lambert.pdf(incoming, scattered, rec), cos_theta / pi, 1e-9),
+              "Lambertian pdf should match the cosine-weighted scatter direction");
+        check(near_vec(attenuation, Color(0.6, 0.7, 0.8), 1e-12),
+              "Lambertian scatter should preserve albedo attenuation");
+        check(near_vec(emission, Color(0, 0, 0), 1e-12),
+              "Lambertian scatter should not emit light");
+    }
+}
+
 void test_display_color_exposure_and_tone_mapping() {
     ImageOutputOptions opts;
     opts.exposure = 2.0;
@@ -1428,6 +1457,7 @@ int main() {
     test_obj_loader_ignores_missing_mtl_file();
     test_triangle_mesh_exposes_internal_acceleration();
     test_pbr_exposes_brdf_and_pdf_for_direct_lighting();
+    test_lambertian_scatter_matches_cosine_pdf_contract();
     test_display_color_exposure_and_tone_mapping();
     test_output_format_detection();
     test_environment_solid_and_gradient_backgrounds();

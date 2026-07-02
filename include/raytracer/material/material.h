@@ -85,9 +85,7 @@ public:
                  Color& emission) const override {
         (void)r_in;
         emission = Color(0, 0, 0);
-        Vec3 dir = rec.normal + random_unit_vector();
-        if (dir.length_squared() < 1e-8) dir = rec.normal;
-        scattered = Ray(rec.p, dir);
+        scattered = Ray(rec.p, random_cosine_direction(rec.normal));
         attenuation = base_color(rec);
         return true;
     }
@@ -99,7 +97,12 @@ public:
 
     double pdf(const Ray& r_in, const Ray& scattered, const HitRecord& rec) const override {
         (void)r_in;
-        double cos_theta = dot(rec.normal, scattered.direction);
+        double dir_len2 = scattered.direction.length_squared();
+        double normal_len2 = rec.normal.length_squared();
+        if (dir_len2 <= 1e-12 || normal_len2 <= 1e-12) return 0;
+        Vec3 unit_dir = scattered.direction / std::sqrt(dir_len2);
+        Vec3 unit_normal = rec.normal / std::sqrt(normal_len2);
+        double cos_theta = dot(unit_normal, unit_dir);
         return cos_theta > 0 ? cos_theta / pi : 0;
     }
 
