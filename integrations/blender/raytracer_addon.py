@@ -14,6 +14,7 @@ import json
 import math
 import mimetypes
 import os
+import shutil
 import struct
 import subprocess
 import tempfile
@@ -39,6 +40,11 @@ from mathutils import Vector
 ENGINE_ID = "RAYTRACER"
 PROTOCOL_VERSION = 1
 GEOMETRY_TYPES = {"MESH", "CURVE", "SURFACE", "FONT", "META"}
+OIDN_CANDIDATES = (
+    "oidnDenoise",
+    "/opt/homebrew/bin/oidnDenoise",
+    "/usr/local/bin/oidnDenoise",
+)
 
 
 def rt_point(v):
@@ -972,6 +978,97 @@ class RenderPixels:
         return rect
 
 
+def find_oidn_denoise():
+    for candidate in OIDN_CANDIDATES:
+        path = shutil.which(candidate)
+        if path:
+            return path
+        if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def write_rgb_pfm(path, pixels):
+    rgb = array.array("f")
+    rgb.extend([0.0] * (pixels.width * pixels.height * 3))
+    dst = 0
+    for src in range(0, len(pixels.pixels), 4):
+        rgb[dst] = pixels.pixels[src]
+        rgb[dst + 1] = pixels.pixels[src + 1]
+        rgb[dst + 2] = pixels.pixels[src + 2]
+        dst += 3
+    if struct.pack("=f", 1.0) != struct.pack("<f", 1.0):
+        rgb.byteswap()
+    with open(path, "wb") as f:
+        f.write(("PF\n%d %d\n-1.0\n" % (pixels.width, pixels.height)).encode("ascii"))
+        f.write(rgb.tobytes())
+
+
+def read_rgb_pfm(path, width, height):
+    with open(path, "rb") as f:
+        magic = f.readline().strip()
+        if magic != b"PF":
+            raise RuntimeError("OIDN output is not RGB PFM")
+        dims = f.readline().strip().split()
+        if len(dims) != 2 or int(dims[0]) != width or int(dims[1]) != height:
+            raise RuntimeError("OIDN output dimensions do not match render")
+        scale = float(f.readline().strip())
+        data = f.read()
+    rgb = array.array("f")
+    rgb.frombytes(data)
+    if scale > 0 and struct.pack("=f", 1.0) == struct.pack("<f", 1.0):
+        rgb.byteswap()
+    expected = width * height * 3
+    if len(rgb) != expected:
+        raise RuntimeError("OIDN output has invalid pixel data")
+    return rgb
+
+
+def denoise_pixels(pixels, settings, debug_cache=None, label="preview"):
+    if not settings.denoise:
+        return pixels
+
+    oidn = find_oidn_denoise()
+    if not oidn:
+        raise RuntimeError("OIDN denoiser is enabled but oidnDenoise was not found")
+
+    with tempfile.TemporaryDirectory(prefix="raytracer_oidn_") as tmp:
+        tmp_path = Path(tmp)
+        input_pfm = tmp_path / "input.pfm"
+        output_pfm = tmp_path / "output.pfm"
+        write_rgb_pfm(input_pfm, pixels)
+        cmd = [
+            oidn,
+            "--hdr", str(input_pfm),
+            "--quality", "balanced",
+            "--threads", str(max(1, int(settings.threads))),
+            "-o", str(output_pfm),
+        ]
+        write_debug_text(debug_cache, "denoise_%s_command.txt" % label, " ".join(cmd) + "\n")
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        write_debug_text(debug_cache, "denoise_%s_stdout.log" % label, result.stdout)
+        write_debug_text(debug_cache, "denoise_%s_stderr.log" % label, result.stderr)
+        if result.returncode != 0:
+            raise RuntimeError("OIDN denoise failed\n" + result.stderr.strip())
+
+        rgb = read_rgb_pfm(output_pfm, pixels.width, pixels.height)
+
+    denoised = array.array("f", pixels.pixels)
+    dst = 0
+    for src in range(0, len(denoised), 4):
+        denoised[src] = max(0.0, rgb[dst])
+        denoised[src + 1] = max(0.0, rgb[dst + 1])
+        denoised[src + 2] = max(0.0, rgb[dst + 2])
+        dst += 3
+    return RenderPixels(pixels.width, pixels.height, denoised)
+
+
+def denoise_preview_pixels(pixels, settings, debug_cache=None, label="preview"):
+    if settings.render_schedule != "SAMPLE_PASSES":
+        return pixels
+    return denoise_pixels(pixels, settings, debug_cache, label)
+
+
 class RendererClient:
     def render(self, package, engine, settings, debug_cache=None):
         raise NotImplementedError
@@ -1045,7 +1142,9 @@ class LocalSubprocessRenderer(RendererClient):
                         try:
                             parts = line.split(" ", 2)
                             progress = float(parts[1])
-                            pixels = read_rgba32f(parts[2].strip())
+                            pixels = denoise_preview_pixels(
+                                read_rgba32f(parts[2].strip()), settings, debug_cache, "partial"
+                            )
                             engine.update_render_pixels(pixels)
                             engine.update_progress(max(0.0, min(0.98, progress)))
                         except Exception as exc:
@@ -1066,7 +1165,7 @@ class LocalSubprocessRenderer(RendererClient):
                     details += "\n" + stdout.strip()
                 raise RuntimeError("Raytracer bridge failed\n" + details)
 
-            return read_rgba32f(result_path)
+            return denoise_pixels(read_rgba32f(result_path), settings, debug_cache, "final")
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -1199,7 +1298,8 @@ class RemoteHttpRenderer(RendererClient):
                         partial = response.read()
                     last_partial_seq = partial_seq
                     write_debug_bytes(debug_cache, "remote_partial_%06d.rgba32f" % partial_seq, partial)
-                    engine.update_render_pixels(parse_rgba32f(partial))
+                    pixels = denoise_preview_pixels(parse_rgba32f(partial), settings, debug_cache, "remote_partial")
+                    engine.update_render_pixels(pixels)
                 except urllib.error.HTTPError as exc:
                     if exc.code not in (202, 404):
                         details = exc.read().decode("utf-8", errors="replace").strip()
@@ -1234,7 +1334,7 @@ class RemoteHttpRenderer(RendererClient):
 
         engine.update_progress(0.99)
         write_debug_bytes(debug_cache, "result.rgba32f", result)
-        return parse_rgba32f(result)
+        return denoise_pixels(parse_rgba32f(result), settings, debug_cache, "remote_final")
 
 
 def parse_rgba32f(data):
@@ -1343,6 +1443,11 @@ class RaytracerSettings(bpy.types.PropertyGroup):
         name="渐进预览",
         default=True,
         description="渲染期间逐步刷新 Render Result；本地和远程后端均支持",
+    )
+    denoise: BoolProperty(
+        name="OIDN 降噪",
+        default=False,
+        description="对全图累积预览和最终 Render Result 应用 Open Image Denoise；不会写回采样累计缓冲",
     )
     light_intensity_scale: FloatProperty(
         name="灯光强度倍率",
@@ -1481,6 +1586,7 @@ class RENDER_PT_raytracer_settings(bpy.types.Panel):
         render_box.prop(settings, "direct_only")
         render_box.prop(settings, "render_schedule")
         render_box.prop(settings, "progressive_preview")
+        render_box.prop(settings, "denoise")
 
         lighting_box = layout.box()
         lighting_box.label(text="光照")
