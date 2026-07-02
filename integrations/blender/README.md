@@ -168,7 +168,7 @@ Blender 插件只承诺导出渲染核心已经支持或可以合理近似的内
 | 修改器、骨骼、动画姿态 | evaluated mesh 当前帧结果 | 当作静态三角网格渲染 | 不导出骨骼或动画，只导出当前帧几何 |
 | 对象世界变换 | 已烘焙到顶点坐标 | 核心收到世界坐标三角形 | 不另存 Blender object transform |
 | 多材质槽 | 按材质索引拆成多个 triangle object | 每组绑定一个核心材质 | 调试 JSON 中可看到拆分后的对象 |
-| UV | `uvs` | 用于核心贴图/材质采样 | 当前 Blender 插件不展开复杂贴图网络 |
+| UV | `uvs` | 用于核心贴图/材质采样 | 有 active UV 时导出 active UV；没有 UV 时会为 generated 坐标路径生成包围盒平面坐标 |
 | Loop normal | `normals` | 命中后插值法线 | 更接近 Blender 平滑/平面着色结果 |
 | 渲染禁用 | 跳过 `hide_render` 对象 | 不进入核心场景 | 对几何和灯光都生效 |
 
@@ -210,14 +210,41 @@ Blender 插件会把当前材质近似转换成本项目渲染核心支持的材
 | Blender Principled BSDF | 导出内容 | 核心处理 | 备注 |
 |-------------------------|----------|----------|------|
 | 无材质 | `pbr` 默认灰色 | PBR 材质 | `albedo=[0.8,0.8,0.8]` |
-| `基础色` | `pbr.albedo` | PBR 基础色 | 支持未连接贴图时的颜色值；复杂节点网络暂不展开 |
-| `金属度` | `pbr.metallic` | PBR metallic | 范围夹到 `[0,1]` |
-| `糙度` | `pbr.roughness` | PBR roughness | 范围夹到 `[0.001,1]` |
+| `基础色` | `pbr.albedo` 或贴图对象 | PBR 基础色 | 支持颜色值，也支持下方列出的常见贴图节点链 |
+| `金属度` | `pbr.metallic` 或贴图对象 | PBR metallic | 标量或标量贴图；最终范围夹到 `[0,1]` |
+| `糙度` | `pbr.roughness` 或贴图对象 | PBR roughness | 标量或标量贴图；最终范围夹到 `[0.001,1]` |
 | `自发光颜色 * 自发光强度` | `emissive.emission` | 自发光材质，可作为面光源 | 强度大于 0 时优先导出为 emissive |
 | `Alpha < 0.35` | `dielectric` | 折射/反射介质 | 作为透明介质近似 |
 | `透射 / Transmission Weight > 0.5` | `dielectric` | 折射/反射介质 | 作为玻璃/水等近似 |
 | `折射率 (IOR)` | `dielectric.ior` | Schlick Fresnel + 折射方向 | 仅导出为 dielectric 时生效 |
-| `基础色` + dielectric | `dielectric.albedo` | 有色玻璃近似 | 核心会用颜色衰减透射/反射 |
+| `基础色` + dielectric | `dielectric.albedo` 或贴图对象 | 有色玻璃近似 | 核心会用颜色衰减透射/反射 |
+
+#### 贴图节点与映射关系
+
+插件会从 Principled BSDF 的 `基础色`、`金属度`、`糙度` 输入沿连接向前解析一组常见节点，并导出为核心可采样的 texture JSON。当前支持：
+
+| Blender 节点/连接 | 导出内容 | 核心处理 | 备注 |
+|-------------------|----------|----------|------|
+| Checker Texture | `{type:"checker", color1, color2, scale, coord, uv_scale, uv_offset, uv_rotation}` | 程序棋盘纹理 | 支持 Color 输出；连接 Fac 输出时按黑白系数导出 |
+| Image Texture | `{type:"image", path, interpolation, extension, color_space, coord, uv_*}` | 图片贴图采样 | 支持 Repeat / Extend / Clip / Mirror，Nearest / Linear，sRGB 解码 |
+| Noise Texture | `{type:"noise", scale, detail, roughness, distortion, coord, uv_*}` | 程序噪声近似 | 用确定性灰度噪声近似 Blender/Cycles 噪声，不保证完全一致 |
+| ColorRamp | `{type:"color_ramp", source, stops, interpolation}` | 颜色渐变映射 | 支持 Linear / Constant / Ease |
+| Math | `{type:"math", operation, a, b, clamp}` | 标量运算 | 支持常见二元运算，例如 add/subtract/multiply/divide/min/max/power/compare |
+| Mix / MixRGB | `{type:"mix", factor, color1, color2}` | 线性插值 | `MixRGB` 目前只支持 Mix 混合模式 |
+| Invert | `{type:"invert", factor, color}` | 颜色反相 | 可用于基础色路径 |
+| Map Range | `{type:"map_range", value, from_min, from_max, to_min, to_max, clamp}` | 标量重映射 | 非 Linear 插值会记录为 unsupported 诊断 |
+| RGB / Value | `{type:"solid", color}` | 常量颜色或常量标量 | Value 会导出为灰度 solid |
+| Reroute | 不单独导出 | 继续追踪输入来源 | 用于整理节点图时不影响导出 |
+
+Mapping 节点会被折叠进被连接的贴图对象：
+
+| Blender Mapping 输入 | 导出字段 | 核心处理 |
+|----------------------|----------|----------|
+| `Scale X/Y` | `uv_scale` | 采样前缩放 UV |
+| `Location X/Y` | `uv_offset` | 缩放/旋转后平移 UV |
+| `Rotation Z` | `uv_rotation`，单位为度 | 在 UV 平面内旋转 |
+
+Texture Coordinate 节点当前识别 `UV`、`Generated` 和 `Object`/`Generated` 类路径。`UV` 会使用 mesh 的 active UV；`Generated`/`Object` 会使用导出时按对象局部包围盒生成的近似坐标。若同一个材质组同时混用 UV 和 Generated 坐标，插件会保留 active UV，并在材质 JSON 上写入 `mixed_texture_coords` 诊断。
 
 核心材质大致处理方式：
 
@@ -225,7 +252,7 @@ Blender 插件会把当前材质近似转换成本项目渲染核心支持的材
 - `dielectric`：玻璃/水等透明介质，使用 IOR、反射/折射和 Schlick Fresnel。
 - `emissive`：直接返回发光颜色，并登记为可采样发光表面。
 
-目前不会导出 Blender 的次表面散射、涂层、边缘光泽、薄膜、体积、背面剔除、阴影模式和完整节点图；这些没有直接对应的核心材质参数。贴图节点如果没有被插件显式解析，也不会自动转换成核心贴图。
+目前不会导出 Blender 的次表面散射、涂层、边缘光泽、薄膜、体积、背面剔除、阴影模式和完整节点图；这些没有直接对应的核心材质参数。贴图节点如果没有被插件显式解析，会在材质 JSON 的 `unsupported_textures` 中记录诊断，并回退到对应输入的默认值或常量值。
 
 ### 调试缓存
 
@@ -238,10 +265,18 @@ Blender 插件会把当前材质近似转换成本项目渲染核心支持的材
 | 远程进度 | `remote_progress.log` | 查看 job 状态 |
 | 渲染结果 | `result.rgba32f` | Blender 收到的线性 RGBA float 图像 |
 
+仓库提供了一个小工具用于检查最新调试缓存中的贴图导出情况：
+
+```bash
+python3 scripts/inspect_texture_export.py debug --fail-on-unsupported
+```
+
+传入调试缓存根目录时，脚本会自动选择最新的 `raytracer_.../scene.rt.json`。如果希望确认场景中确实导出了 Checker Texture，可以额外加 `--expect-checker`。
+
 ## 当前限制
 
-- 不支持完整 Blender 节点材质图和复杂贴图网络。
-- 不支持真正的面光源采样、体光源、World HDRI/Sky Texture。
+- 不支持完整 Blender 节点材质图；当前只解析上面列出的常见贴图节点链。
+- 不支持体光源、World HDRI/Sky Texture。
 - 不支持交互式 viewport path tracing、AOV/pass、多视图层差异化输出。
 - 不支持运动模糊、体积散射、粒子/毛发专用渲染属性。
 - 远程模式当前使用轮询查询进度，不是 WebSocket/SSE 流式推送。

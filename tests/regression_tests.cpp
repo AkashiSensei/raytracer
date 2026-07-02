@@ -752,6 +752,287 @@ void test_transformed_texture_applies_uv_scale_offset() {
     Color c = tex.value(0.25, 0.5, Point3(0, 0, 0));
     // u' = 0.25 * 2 + 0.5 = 1.0; v' = 0.5 * 1 + 0 = 0.5; solid ignores UV so color unchanged
     check(near_vec(c, Color(0.4, 0.6, 0.8)), "TransformedTexture should pass through to wrapped texture");
+
+    auto checker = std::make_shared<CheckerTexture>(Color(1, 1, 1), Color(0, 0, 0), 1.0);
+    TransformedTexture rotated(checker, Vec2(1.0, 1.0), Vec2(0.5, 0.0), 90.0);
+    check(near_vec(rotated.value(0.25, 0.25, Point3()), Color(1, 1, 1), 1e-6),
+          "TransformedTexture should apply offset after rotation");
+}
+
+void test_checker_texture_json_scale_and_offset() {
+    JsonValue checker = parse_json(
+        "{\"type\":\"checker\",\"color1\":[1,1,1],\"color2\":[0,0,0],"
+        "\"scale\":2,\"uv_scale\":[1,1],\"uv_offset\":[0.25,0]}");
+    auto tex = parse_texture_json(checker, std::filesystem::current_path());
+    check(near_vec(tex->value(0.0, 0.0, Point3()), Color(1, 1, 1)),
+          "checker texture should sample color1 in the first transformed cell");
+    check(near_vec(tex->value(0.25, 0.0, Point3()), Color(0, 0, 0)),
+          "checker texture uv_offset and scale should move sampling into the adjacent cell");
+
+    JsonValue rotated_checker = parse_json(
+        "{\"type\":\"checker\",\"color1\":[1,1,1],\"color2\":[0,0,0],"
+        "\"scale\":1,\"uv_scale\":[1,1],\"uv_offset\":[0.5,0],\"uv_rotation\":90}");
+    auto rotated = parse_texture_json(rotated_checker, std::filesystem::current_path());
+    check(near_vec(rotated->value(0.25, 0.25, Point3()), Color(1, 1, 1), 1e-6),
+          "checker texture should apply uv_offset after uv_rotation");
+
+    std::ofstream out("/tmp/rt_checker_material.json");
+    out << "{"
+        << "\"image\":{\"width\":8,\"height\":8,\"samples\":1},"
+        << "\"camera\":{\"lookfrom\":[0,0,2],\"lookat\":[0,0,0],\"vfov\":60},"
+        << "\"objects\":[{\"type\":\"sphere\",\"center\":[0,0,0],\"radius\":1,"
+        << "\"material\":{\"type\":\"pbr\",\"albedo\":{\"type\":\"checker\","
+        << "\"color1\":[0.9,0.9,0.9],\"color2\":[0.1,0.1,0.1],\"scale\":4},"
+        << "\"metallic\":0,\"roughness\":0.5}}]"
+        << "}";
+    out.close();
+    Scene scene;
+    load_scene("/tmp/rt_checker_material.json", scene);
+    HitRecord rec;
+    rec.u = 0.1;
+    rec.v = 0.1;
+    rec.p = Point3();
+    check(near_vec(scene.materials[0]->base_color(rec), Color(0.9, 0.9, 0.9), 1e-6),
+          "PBR albedo should accept a checker texture object");
+}
+
+void test_image_texture_json_accepts_uv_mapping_fields() {
+    std::string checker_path = (std::filesystem::current_path() / "textures/checkerboard.png").string();
+    JsonValue image = parse_json(
+        "{\"type\":\"image\",\"path\":\"textures/checkerboard.png\","
+        "\"uv_scale\":[5,5],\"uv_offset\":[0,0],\"uv_rotation\":0}");
+    auto tex = parse_texture_json(image, std::filesystem::current_path());
+    Color c = tex->value(0.1, 0.1, Point3());
+    check(finite_vec(c) && c.x >= 0.0 && c.x <= 1.0 && c.y >= 0.0 && c.y <= 1.0 && c.z >= 0.0 && c.z <= 1.0,
+          "image texture JSON with UV mapping fields should load and sample a finite color");
+
+    std::ofstream out("/tmp/rt_image_texture_mapping.json");
+    out << "{"
+        << "\"image\":{\"width\":8,\"height\":8,\"samples\":1},"
+        << "\"camera\":{\"lookfrom\":[0,0,2],\"lookat\":[0,0,0],\"vfov\":60},"
+        << "\"objects\":[{\"type\":\"sphere\",\"center\":[0,0,0],\"radius\":1,"
+        << "\"material\":{\"type\":\"pbr\",\"albedo\":{\"type\":\"image\","
+        << "\"path\":\"" << checker_path << "\",\"uv_scale\":[5,5]},"
+        << "\"metallic\":0,\"roughness\":0.5}}]"
+        << "}";
+    out.close();
+    Scene scene;
+    load_scene("/tmp/rt_image_texture_mapping.json", scene);
+    HitRecord rec;
+    rec.u = 0.12;
+    rec.v = 0.34;
+    rec.p = Point3();
+    Color base = scene.materials[0]->base_color(rec);
+    check(finite_vec(base), "PBR albedo should accept an image texture object with UV mapping");
+}
+
+void test_image_texture_linear_interpolation() {
+    ImageTexture tex;
+    tex.width = 2;
+    tex.height = 1;
+    tex.pixels = {Color(0, 0, 0), Color(1, 1, 1)};
+    tex.interpolation = ImageTexture::Interpolation::Linear;
+    Color middle = tex.value(0.5, 0.5, Point3());
+    check(near_vec(middle, Color(0.5, 0.5, 0.5), 1e-6),
+          "ImageTexture linear interpolation should blend neighboring texels");
+}
+
+void test_image_texture_srgb_decode() {
+    ImageTexture tex;
+    tex.width = 1;
+    tex.height = 1;
+    tex.pixels = {Color(0.5, 0.5, 0.5)};
+    tex.decode_srgb = true;
+    Color linear = tex.value(0.5, 0.5, Point3());
+    check(near(linear.x, 0.21404114048223255, 1e-6) &&
+          near(linear.y, 0.21404114048223255, 1e-6) &&
+          near(linear.z, 0.21404114048223255, 1e-6),
+          "ImageTexture should decode sRGB texels to linear when requested");
+}
+
+void test_image_texture_extension_modes() {
+    ImageTexture tex;
+    tex.width = 2;
+    tex.height = 1;
+    tex.pixels = {Color(0, 0, 0), Color(1, 1, 1)};
+
+    tex.extension = ImageTexture::Extension::Extend;
+    check(near_vec(tex.value(1.25, 0.5, Point3()), Color(1, 1, 1), 1e-6),
+          "ImageTexture extend mode should clamp UVs to the texture edge");
+
+    tex.extension = ImageTexture::Extension::Clip;
+    check(near_vec(tex.value(1.25, 0.5, Point3()), Color(0, 0, 0), 1e-6),
+          "ImageTexture clip mode should return black outside 0..1 UVs");
+
+    tex.extension = ImageTexture::Extension::Mirror;
+    check(near_vec(tex.value(1.25, 0.5, Point3()), Color(1, 1, 1), 1e-6) &&
+          near_vec(tex.value(-0.25, 0.5, Point3()), Color(0, 0, 0), 1e-6),
+          "ImageTexture mirror mode should mirror-repeat UVs");
+
+    tex.interpolation = ImageTexture::Interpolation::Linear;
+    tex.extension = ImageTexture::Extension::Extend;
+    check(near_vec(tex.value(0.0, 0.5, Point3()), Color(0, 0, 0), 1e-6) &&
+          near_vec(tex.value(1.0, 0.5, Point3()), Color(1, 1, 1), 1e-6),
+          "ImageTexture linear extend mode should clamp edge samples instead of wrapping");
+
+    tex.extension = ImageTexture::Extension::Clip;
+    check(near_vec(tex.value(0.0, 0.5, Point3()), Color(0, 0, 0), 1e-6) &&
+          near_vec(tex.value(1.0, 0.5, Point3()), Color(1, 1, 1), 1e-6),
+          "ImageTexture linear clip mode should clamp in-range edge samples instead of wrapping");
+}
+
+void test_color_ramp_texture_json_wraps_source_texture() {
+    JsonValue ramp = parse_json(
+        "{\"type\":\"color_ramp\",\"source\":{\"type\":\"checker\",\"color1\":[0,0,0],"
+        "\"color2\":[1,1,1],\"scale\":2},\"stops\":["
+        "{\"position\":0,\"color\":[1,0,0]},"
+        "{\"position\":1,\"color\":[0,0,1]}]}");
+    auto tex = parse_texture_json(ramp, std::filesystem::current_path());
+    check(near_vec(tex->value(0.1, 0.1, Point3()), Color(1, 0, 0), 1e-6),
+          "ColorRampTexture JSON should map dark source values to the first ramp color");
+    check(near_vec(tex->value(0.6, 0.1, Point3()), Color(0, 0, 1), 1e-6),
+          "ColorRampTexture JSON should map bright source values to the last ramp color");
+}
+
+void test_color_ramp_texture_interpolation_modes() {
+    JsonValue constant = parse_json(
+        "{\"type\":\"color_ramp\",\"interpolation\":\"constant\","
+        "\"source\":{\"type\":\"solid\",\"color\":[0.5,0.5,0.5]},\"stops\":["
+        "{\"position\":0,\"color\":[1,0,0]},"
+        "{\"position\":1,\"color\":[0,0,1]}]}");
+    auto constant_tex = parse_texture_json(constant, std::filesystem::current_path());
+    check(near_vec(constant_tex->value(0.0, 0.0, Point3()), Color(1, 0, 0), 1e-6),
+          "ColorRampTexture constant interpolation should hold the previous stop color");
+
+    JsonValue ease = parse_json(
+        "{\"type\":\"color_ramp\",\"interpolation\":\"ease\","
+        "\"source\":{\"type\":\"solid\",\"color\":[0.25,0.25,0.25]},\"stops\":["
+        "{\"position\":0,\"color\":[0,0,0]},"
+        "{\"position\":1,\"color\":[1,1,1]}]}");
+    auto ease_tex = parse_texture_json(ease, std::filesystem::current_path());
+    check(near_vec(ease_tex->value(0.0, 0.0, Point3()), Color(0.15625, 0.15625, 0.15625), 1e-6),
+          "ColorRampTexture ease interpolation should smooth the ramp factor");
+}
+
+void test_math_and_mix_texture_json_nodes() {
+    JsonValue math = parse_json(
+        "{\"type\":\"math\",\"operation\":\"multiply\","
+        "\"a\":{\"type\":\"checker\",\"color1\":[0,0,0],\"color2\":[1,1,1],\"scale\":2},"
+        "\"b\":{\"type\":\"solid\",\"color\":[0.5,0.5,0.5]}}");
+    auto math_tex = parse_texture_json(math, std::filesystem::current_path());
+    check(near_vec(math_tex->value(0.1, 0.1, Point3()), Color(0, 0, 0), 1e-6) &&
+          near_vec(math_tex->value(0.6, 0.1, Point3()), Color(0.5, 0.5, 0.5), 1e-6),
+          "MathTexture JSON should preserve dynamic scalar texture inputs");
+
+    JsonValue mix = parse_json(
+        "{\"type\":\"mix\",\"factor\":{\"type\":\"solid\",\"color\":[0.25,0.25,0.25]},"
+        "\"color1\":{\"type\":\"solid\",\"color\":[1,0,0]},"
+        "\"color2\":{\"type\":\"solid\",\"color\":[0,0,1]}}");
+    auto mix_tex = parse_texture_json(mix, std::filesystem::current_path());
+    check(near_vec(mix_tex->value(0.0, 0.0, Point3()), Color(0.75, 0.0, 0.25), 1e-6),
+          "MixTexture JSON should linearly blend two color textures");
+
+    JsonValue clamped = parse_json(
+        "{\"type\":\"math\",\"operation\":\"add\",\"clamp\":true,"
+        "\"a\":{\"type\":\"solid\",\"color\":[0.75,0.75,0.75]},"
+        "\"b\":{\"type\":\"solid\",\"color\":[0.75,0.75,0.75]}}");
+    auto clamped_tex = parse_texture_json(clamped, std::filesystem::current_path());
+    check(near_vec(clamped_tex->value(0.0, 0.0, Point3()), Color(1, 1, 1), 1e-6),
+          "MathTexture JSON should clamp scalar results when requested");
+
+    JsonValue material = parse_json(
+        "{\"type\":\"pbr\",\"albedo\":[0.8,0.8,0.8],\"metallic\":0,"
+        "\"roughness\":{\"type\":\"mix\","
+        "\"factor\":{\"type\":\"solid\",\"color\":[0.25,0.25,0.25]},"
+        "\"color1\":{\"type\":\"solid\",\"color\":[0.2,0.2,0.2]},"
+        "\"color2\":{\"type\":\"solid\",\"color\":[0.6,0.6,0.6]}}}");
+    Scene scene;
+    Material* mat = parse_material(material, scene, std::filesystem::current_path());
+    auto* pbr = dynamic_cast<PBR*>(mat);
+    check(pbr != nullptr &&
+          near(pbr->roughness->value(0.0, 0.0, Point3()).x, 0.3, 1e-6),
+          "PBR scalar fields should accept MixTexture JSON nodes");
+}
+
+void test_noise_texture_json_is_deterministic_and_transformable() {
+    JsonValue noise = parse_json(
+        "{\"type\":\"noise\",\"scale\":6,\"detail\":4,\"roughness\":0.55,\"distortion\":0.25}");
+    auto tex = parse_texture_json(noise, std::filesystem::current_path());
+    Color a = tex->value(0.17, 0.29, Point3());
+    Color b = tex->value(0.17, 0.29, Point3());
+    check(near_vec(a, b, 1e-12) &&
+          a.x >= 0.0 && a.x <= 1.0 &&
+          a.y >= 0.0 && a.y <= 1.0 &&
+          a.z >= 0.0 && a.z <= 1.0,
+          "NoiseTexture JSON should be deterministic and normalized");
+
+    JsonValue transformed = parse_json(
+        "{\"type\":\"noise\",\"scale\":6,\"detail\":4,\"uv_offset\":[0.25,0.0]}");
+    auto moved = parse_texture_json(transformed, std::filesystem::current_path());
+    Color c = moved->value(0.17, 0.29, Point3());
+    check(!near_vec(a, c, 1e-6),
+          "NoiseTexture JSON should honor UV transform wrappers");
+}
+
+void test_invert_and_map_range_texture_json_nodes() {
+    JsonValue invert = parse_json(
+        "{\"type\":\"invert\",\"factor\":{\"type\":\"solid\",\"color\":[1,1,1]},"
+        "\"color\":{\"type\":\"checker\",\"color1\":[0.2,0.2,0.2],"
+        "\"color2\":[0.8,0.8,0.8],\"scale\":2}}");
+    auto invert_tex = parse_texture_json(invert, std::filesystem::current_path());
+    check(near_vec(invert_tex->value(0.1, 0.1, Point3()), Color(0.8, 0.8, 0.8), 1e-6) &&
+          near_vec(invert_tex->value(0.6, 0.1, Point3()), Color(0.2, 0.2, 0.2), 1e-6),
+          "InvertTexture JSON should dynamically invert wrapped texture colors");
+
+    JsonValue mapped = parse_json(
+        "{\"type\":\"map_range\",\"from_min\":0,\"from_max\":1,\"to_min\":0.2,\"to_max\":0.6,"
+        "\"value\":{\"type\":\"checker\",\"color1\":[0,0,0],\"color2\":[1,1,1],\"scale\":2}}");
+    auto mapped_tex = parse_texture_json(mapped, std::filesystem::current_path());
+    check(near_vec(mapped_tex->value(0.1, 0.1, Point3()), Color(0.2, 0.2, 0.2), 1e-6) &&
+          near_vec(mapped_tex->value(0.6, 0.1, Point3()), Color(0.6, 0.6, 0.6), 1e-6),
+          "MapRangeTexture JSON should dynamically remap scalar texture values");
+}
+
+void test_texture_export_metadata_is_ignored_by_scene_parser() {
+    JsonValue material = parse_json(
+        "{\"type\":\"pbr\",\"unsupported_textures\":[\"MUSGRAVE\"],"
+        "\"albedo\":{\"type\":\"checker\",\"coord\":\"generated\","
+        "\"color1\":[1,1,1],\"color2\":[0,0,0],\"scale\":2},"
+        "\"metallic\":0,\"roughness\":0.5}");
+    Scene scene;
+    Material* mat = parse_material(material, scene, std::filesystem::current_path());
+    auto* pbr = dynamic_cast<PBR*>(mat);
+    check(pbr != nullptr, "PBR material should parse with texture export metadata present");
+    if (pbr == nullptr) return;
+    HitRecord rec;
+    rec.u = 0.1;
+    rec.v = 0.1;
+    rec.p = Point3();
+    check(near_vec(pbr->base_color(rec), Color(1, 1, 1), 1e-6),
+          "texture coord metadata should not alter renderer-side texture sampling");
+}
+
+void test_pbr_scalar_fields_accept_texture_objects() {
+    JsonValue material = parse_json(
+        "{\"type\":\"pbr\",\"albedo\":[0.8,0.8,0.8],"
+        "\"metallic\":{\"type\":\"checker\",\"color1\":[0,0,0],\"color2\":[1,1,1],\"scale\":2},"
+        "\"roughness\":{\"type\":\"color_ramp\",\"source\":{\"type\":\"checker\","
+        "\"color1\":[0,0,0],\"color2\":[1,1,1],\"scale\":2},\"stops\":["
+        "{\"position\":0,\"color\":[0.25,0,0]},"
+        "{\"position\":1,\"color\":[0.75,0,0]}]}}");
+
+    Scene scene;
+    Material* mat = parse_material(material, scene, std::filesystem::current_path());
+    auto* pbr = dynamic_cast<PBR*>(mat);
+    check(pbr != nullptr, "PBR material should parse for scalar texture regression");
+    if (pbr == nullptr) return;
+
+    check(near(pbr->metallic->value(0.1, 0.1, Point3()).x, 0.0, 1e-6) &&
+          near(pbr->metallic->value(0.6, 0.1, Point3()).x, 1.0, 1e-6),
+          "PBR metallic should accept a checker texture object");
+    check(near(pbr->roughness->value(0.1, 0.1, Point3()).x, 0.25, 1e-6) &&
+          near(pbr->roughness->value(0.6, 0.1, Point3()).x, 0.75, 1e-6),
+          "PBR roughness should accept a color-ramp texture object");
 }
 
 void test_random_seed_repeats_sequence() {
@@ -1009,6 +1290,18 @@ int main() {
     test_dielectric_partial_transmission_factor_stores();
     test_material_alpha_mask_interface();
     test_transformed_texture_applies_uv_scale_offset();
+    test_checker_texture_json_scale_and_offset();
+    test_image_texture_json_accepts_uv_mapping_fields();
+    test_image_texture_linear_interpolation();
+    test_image_texture_srgb_decode();
+    test_image_texture_extension_modes();
+    test_color_ramp_texture_json_wraps_source_texture();
+    test_color_ramp_texture_interpolation_modes();
+    test_math_and_mix_texture_json_nodes();
+    test_noise_texture_json_is_deterministic_and_transformable();
+    test_invert_and_map_range_texture_json_nodes();
+    test_texture_export_metadata_is_ignored_by_scene_parser();
+    test_pbr_scalar_fields_accept_texture_objects();
     test_json_dielectric_accepts_volume_attenuation();
     test_random_seed_repeats_sequence();
     test_random_double_stays_in_unit_interval();

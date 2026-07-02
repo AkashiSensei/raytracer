@@ -99,8 +99,285 @@ def principled_base_color(principled, default):
     return value
 
 
+def socket_default_vector(socket, default):
+    if socket is None:
+        return [float(default[0]), float(default[1]), float(default[2])]
+    value = getattr(socket, "default_value", default)
+    try:
+        return [float(value[0]), float(value[1]), float(value[2])]
+    except (TypeError, IndexError):
+        return [float(default[0]), float(default[1]), float(default[2])]
+
+
 def clamp_float(value, lo, hi):
     return float(max(lo, min(hi, value)))
+
+
+def first_linked_node(socket):
+    if socket is None or not socket.is_linked or not socket.links:
+        return None
+    return socket.links[0].from_node
+
+
+def first_linked_socket(socket):
+    if socket is None or not socket.is_linked or not socket.links:
+        return None
+    return socket.links[0].from_socket
+
+
+def linked_source(socket):
+    if socket is None or not socket.is_linked or not socket.links:
+        return (None, None)
+
+    link = socket.links[0]
+    node = link.from_node
+    source_socket = link.from_socket
+    guard = 0
+    while node is not None and node.type == "REROUTE" and guard < 32:
+        guard += 1
+        input_socket = input_by_name(node, ("Input",))
+        if input_socket is None or not input_socket.is_linked or not input_socket.links:
+            return (None, None)
+        link = input_socket.links[0]
+        node = link.from_node
+        source_socket = link.from_socket
+    return (node, source_socket)
+
+
+def input_by_name(node, names):
+    return socket_by_name(node, names)
+
+
+def unwrap_reroute(node):
+    while node is not None and node.type == "REROUTE":
+        node = first_linked_node(input_by_name(node, ("Input",)))
+    return node
+
+
+def mapping_transform_from_socket(vector_socket):
+    transform = {
+        "uv_scale": [1.0, 1.0],
+        "uv_offset": [0.0, 0.0],
+        "uv_rotation": 0.0,
+    }
+    node = unwrap_reroute(first_linked_node(vector_socket))
+    if node is None or node.type != "MAPPING":
+        return transform
+
+    location = socket_default_vector(input_by_name(node, ("Location", "位置")), (0.0, 0.0, 0.0))
+    rotation = socket_default_vector(input_by_name(node, ("Rotation", "旋转")), (0.0, 0.0, 0.0))
+    scale = socket_default_vector(input_by_name(node, ("Scale", "缩放")), (1.0, 1.0, 1.0))
+    transform["uv_scale"] = [float(scale[0]), float(scale[1])]
+    transform["uv_offset"] = [float(location[0]), float(location[1])]
+    transform["uv_rotation"] = float(math.degrees(rotation[2]))
+    return transform
+
+
+def texture_coord_source_from_socket(vector_socket, default="uv"):
+    node, linked_socket = linked_source(vector_socket)
+    if node is None:
+        return default
+    socket_name = str(getattr(linked_socket, "name", ""))
+    socket_identifier = str(getattr(linked_socket, "identifier", ""))
+    if node.type == "TEX_COORD":
+        name = (socket_name or socket_identifier).lower()
+        if "generated" in name or "object" in name or "生成" in name or "物体" in name:
+            return "generated"
+        if "uv" in name:
+            return "uv"
+    if node.type == "MAPPING":
+        return texture_coord_source_from_socket(input_by_name(node, ("Vector", "矢量")), default)
+    return default
+
+
+def socket_default_scalar(socket, default):
+    if socket is None:
+        return float(default)
+    try:
+        return float(getattr(socket, "default_value", default))
+    except TypeError:
+        return float(default)
+
+
+def note_unsupported_texture(unsupported, node):
+    if unsupported is None or node is None:
+        return
+    name = str(getattr(node, "type", "UNKNOWN"))
+    if name not in unsupported:
+        unsupported.append(name)
+
+
+def scalar_texture_from_input(socket, default, unsupported=None):
+    texture = texture_from_socket(socket, None, unsupported)
+    if texture is not None:
+        return texture
+    value = socket_default_scalar(socket, default)
+    return {"type": "solid", "color": [value, value, value]}
+
+
+def color_texture_from_input(socket, default, unsupported=None):
+    texture = texture_from_socket(socket, None, unsupported)
+    if texture is not None:
+        return texture
+    return {"type": "solid", "color": socket_default_color(socket, default)}
+
+
+def texture_from_socket(socket, material, unsupported=None):
+    node, linked_socket = linked_source(socket)
+    if node is None:
+        return None
+    linked_socket_name = getattr(linked_socket, "name", "") if linked_socket is not None else ""
+
+    if node.type == "VALUE":
+        value = socket_default_scalar(linked_socket, 0.0)
+        return {"type": "solid", "color": [value, value, value]}
+
+    if node.type == "VALTORGB":
+        fac_socket = input_by_name(node, ("Fac", "Factor", "系数"))
+        source = texture_from_socket(fac_socket, material, unsupported)
+        if source is None:
+            fac_value = socket_float(node, ("Fac", "Factor", "系数"), 0.0)
+            source = {
+                "type": "solid",
+                "color": [float(fac_value), float(fac_value), float(fac_value)],
+            }
+
+        stops = []
+        color_ramp = getattr(node, "color_ramp", None)
+        if color_ramp is not None:
+            for element in color_ramp.elements:
+                color = element.color
+                stops.append({
+                    "position": float(element.position),
+                    "color": [float(color[0]), float(color[1]), float(color[2])],
+                })
+        return {
+            "type": "color_ramp",
+            "source": source,
+            "stops": stops,
+            "interpolation": str(getattr(color_ramp, "interpolation", "LINEAR")).lower() if color_ramp is not None else "linear",
+        }
+
+    if node.type == "MATH":
+        input_a = node.inputs[0] if len(node.inputs) > 0 else None
+        input_b = node.inputs[1] if len(node.inputs) > 1 else None
+        return {
+            "type": "math",
+            "operation": str(getattr(node, "operation", "ADD")).lower(),
+            "a": scalar_texture_from_input(input_a, 0.0, unsupported),
+            "b": scalar_texture_from_input(input_b, 0.0, unsupported),
+            "clamp": bool(getattr(node, "use_clamp", False)),
+        }
+
+    if node.type in {"MIX_RGB", "MIX"}:
+        blend_type = str(getattr(node, "blend_type", "MIX")).upper()
+        if node.type == "MIX_RGB" and blend_type != "MIX":
+            note_unsupported_texture(unsupported, node)
+            return None
+        data_type = str(getattr(node, "data_type", "RGBA")).upper()
+        fac_socket = input_by_name(node, ("Fac", "Factor", "系数"))
+        color1_socket = input_by_name(node, ("Color1", "A", "颜色1"))
+        color2_socket = input_by_name(node, ("Color2", "B", "颜色2"))
+        if node.type == "MIX" and data_type in {"FLOAT", "VALUE"}:
+            color1 = scalar_texture_from_input(color1_socket, 0.0, unsupported)
+            color2 = scalar_texture_from_input(color2_socket, 1.0, unsupported)
+        else:
+            color1 = color_texture_from_input(color1_socket, (0.0, 0.0, 0.0), unsupported)
+            color2 = color_texture_from_input(color2_socket, (1.0, 1.0, 1.0), unsupported)
+        return {
+            "type": "mix",
+            "factor": scalar_texture_from_input(fac_socket, 0.5, unsupported),
+            "color1": color1,
+            "color2": color2,
+        }
+
+    if node.type == "INVERT":
+        fac_socket = input_by_name(node, ("Fac", "Factor", "系数"))
+        color_socket = input_by_name(node, ("Color", "颜色"))
+        return {
+            "type": "invert",
+            "factor": scalar_texture_from_input(fac_socket, 1.0, unsupported),
+            "color": color_texture_from_input(color_socket, (1.0, 1.0, 1.0), unsupported),
+        }
+
+    if node.type == "MAP_RANGE":
+        interpolation = str(getattr(node, "interpolation_type", "LINEAR")).upper()
+        if interpolation not in {"LINEAR", ""}:
+            note_unsupported_texture(unsupported, node)
+        value_socket = input_by_name(node, ("Value", "值"))
+        from_min_socket = input_by_name(node, ("From Min", "源最小值"))
+        from_max_socket = input_by_name(node, ("From Max", "源最大值"))
+        to_min_socket = input_by_name(node, ("To Min", "目标最小值"))
+        to_max_socket = input_by_name(node, ("To Max", "目标最大值"))
+        return {
+            "type": "map_range",
+            "value": scalar_texture_from_input(value_socket, 0.0, unsupported),
+            "from_min": socket_default_scalar(from_min_socket, 0.0),
+            "from_max": socket_default_scalar(from_max_socket, 1.0),
+            "to_min": socket_default_scalar(to_min_socket, 0.0),
+            "to_max": socket_default_scalar(to_max_socket, 1.0),
+            "clamp": bool(getattr(node, "clamp", getattr(node, "use_clamp", True))),
+        }
+
+    if node.type == "TEX_CHECKER":
+        vector_socket = input_by_name(node, ("Vector", "矢量"))
+        transform = mapping_transform_from_socket(vector_socket)
+        coord = texture_coord_source_from_socket(vector_socket, "generated")
+        if linked_socket_name in ("Fac", "Factor", "系数"):
+            color1 = [0.0, 0.0, 0.0]
+            color2 = [1.0, 1.0, 1.0]
+        else:
+            color1 = socket_color(node, ("Color1", "Color 1", "颜色1"), (0.8, 0.8, 0.8))
+            color2 = socket_color(node, ("Color2", "Color 2", "颜色2"), (0.2, 0.2, 0.2))
+        scale = socket_float(node, ("Scale", "缩放"), 5.0)
+        return {
+            "type": "checker",
+            "color1": color1,
+            "color2": color2,
+            "scale": float(scale),
+            "coord": coord,
+            **transform,
+        }
+
+    if node.type == "TEX_NOISE":
+        vector_socket = input_by_name(node, ("Vector", "矢量"))
+        return {
+            "type": "noise",
+            "scale": socket_float(node, ("Scale", "缩放"), 5.0),
+            "detail": socket_float(node, ("Detail", "细节"), 2.0),
+            "roughness": socket_float(node, ("Roughness", "粗糙度"), 0.5),
+            "distortion": socket_float(node, ("Distortion", "扭曲"), 0.0),
+            "coord": texture_coord_source_from_socket(vector_socket, "generated"),
+            **mapping_transform_from_socket(vector_socket),
+        }
+
+    if node.type == "TEX_IMAGE":
+        image = getattr(node, "image", None)
+        if image is None:
+            return None
+        path = bpy.path.abspath(image.filepath, library=getattr(image, "library", None))
+        if not path:
+            return None
+        vector_socket = input_by_name(node, ("Vector", "矢量"))
+        return {
+            "type": "image",
+            "path": path,
+            "interpolation": str(getattr(node, "interpolation", "Linear")).lower(),
+            "extension": str(getattr(node, "extension", "REPEAT")).lower(),
+            "color_space": str(getattr(getattr(image, "colorspace_settings", None), "name", "")),
+            "coord": texture_coord_source_from_socket(vector_socket, "uv"),
+            **mapping_transform_from_socket(vector_socket),
+        }
+
+    if node.type == "RGB":
+        color_socket = node.outputs.get("Color") if hasattr(node.outputs, "get") else None
+        return {
+            "type": "solid",
+            "color": socket_default_color(color_socket, (0.8, 0.8, 0.8)),
+        }
+
+    note_unsupported_texture(unsupported, node)
+    return None
 
 
 def transformed_normal(matrix, normal):
@@ -126,6 +403,7 @@ def material_to_rt(material):
     transmission = 0.0
     emission = [0.0, 0.0, 0.0]
     emission_strength = 0.0
+    unsupported_textures = []
 
     if material.use_nodes and material.node_tree is not None:
         principled = None
@@ -134,10 +412,16 @@ def material_to_rt(material):
                 principled = node
                 break
         if principled is not None:
-            base = principled_base_color(principled, base)
+            base_socket = socket_by_name(principled, ("Base Color",))
+            base_texture = texture_from_socket(base_socket, material, unsupported_textures)
+            base = base_texture if base_texture is not None else principled_base_color(principled, base)
             alpha = socket_float(principled, ("Alpha",), alpha)
-            metallic = socket_float(principled, ("Metallic",), metallic)
-            roughness = socket_float(principled, ("Roughness",), roughness)
+            metallic_socket = socket_by_name(principled, ("Metallic",))
+            metallic_texture = texture_from_socket(metallic_socket, material, unsupported_textures)
+            metallic = metallic_texture if metallic_texture is not None else socket_float(principled, ("Metallic",), metallic)
+            roughness_socket = socket_by_name(principled, ("Roughness",))
+            roughness_texture = texture_from_socket(roughness_socket, material, unsupported_textures)
+            roughness = roughness_texture if roughness_texture is not None else socket_float(principled, ("Roughness",), roughness)
             ior = socket_float(principled, ("IOR", "折射率"), ior)
             transmission = socket_float(
                 principled,
@@ -148,7 +432,7 @@ def material_to_rt(material):
             emission_strength = socket_float(principled, ("Emission Strength",), emission_strength)
 
     if emission_strength > 0.0:
-        return {
+        result = {
             "type": "emissive",
             "emission": [
                 float(emission[0] * emission_strength),
@@ -156,24 +440,33 @@ def material_to_rt(material):
                 float(emission[2] * emission_strength),
             ],
         }
+        if unsupported_textures:
+            result["unsupported_textures"] = unsupported_textures
+        return result
 
     if alpha < 0.35 or transmission > 0.5:
-        return {
+        result = {
             "type": "dielectric",
             "ior": max(1.0, float(ior)),
-            "albedo": [
+            "albedo": base if isinstance(base, dict) else [
                 clamp_float(base[0], 0.0, 1.0),
                 clamp_float(base[1], 0.0, 1.0),
                 clamp_float(base[2], 0.0, 1.0),
             ],
         }
+        if unsupported_textures:
+            result["unsupported_textures"] = unsupported_textures
+        return result
 
-    return {
+    result = {
         "type": "pbr",
         "albedo": base,
-        "metallic": clamp_float(metallic, 0.0, 1.0),
-        "roughness": clamp_float(roughness, 0.001, 1.0),
+        "metallic": metallic if isinstance(metallic, dict) else clamp_float(metallic, 0.0, 1.0),
+        "roughness": roughness if isinstance(roughness, dict) else clamp_float(roughness, 0.001, 1.0),
     }
+    if unsupported_textures:
+        result["unsupported_textures"] = unsupported_textures
+    return result
 
 
 def export_camera(scene, depsgraph, width, height):
@@ -310,6 +603,60 @@ def material_for_slot(obj, material_index):
     return None
 
 
+def material_texture_coords(value):
+    coords = set()
+    if isinstance(value, dict):
+        coord = value.get("coord")
+        if coord in {"generated", "uv"}:
+            coords.add(coord)
+        for child in value.values():
+            coords.update(material_texture_coords(child))
+    if isinstance(value, list):
+        for child in value:
+            coords.update(material_texture_coords(child))
+    return coords
+
+
+def mesh_generated_bounds(mesh):
+    if not mesh.vertices:
+        return (Vector((0.0, 0.0, 0.0)), Vector((1.0, 1.0, 1.0)))
+    mins = Vector((mesh.vertices[0].co.x, mesh.vertices[0].co.y, mesh.vertices[0].co.z))
+    maxs = Vector((mins.x, mins.y, mins.z))
+    for vertex in mesh.vertices[1:]:
+        co = vertex.co
+        mins.x = min(mins.x, co.x)
+        mins.y = min(mins.y, co.y)
+        mins.z = min(mins.z, co.z)
+        maxs.x = max(maxs.x, co.x)
+        maxs.y = max(maxs.y, co.y)
+        maxs.z = max(maxs.z, co.z)
+    return (mins, maxs)
+
+
+def generated_uv(mesh, vertex_index, loop_index, bounds):
+    mins, maxs = bounds
+    co = mesh.vertices[vertex_index].co
+    spans = Vector((
+        max(maxs.x - mins.x, 1e-12),
+        max(maxs.y - mins.y, 1e-12),
+        max(maxs.z - mins.z, 1e-12),
+    ))
+    generated = (
+        (co.x - mins.x) / spans.x,
+        (co.y - mins.y) / spans.y,
+        (co.z - mins.z) / spans.z,
+    )
+    normal = mesh.loops[loop_index].normal
+    ax = abs(normal.x)
+    ay = abs(normal.y)
+    az = abs(normal.z)
+    if ax >= ay and ax >= az:
+        return [float(generated[1]), float(generated[2])]
+    if ay >= ax and ay >= az:
+        return [float(generated[0]), float(generated[2])]
+    return [float(generated[0]), float(generated[1])]
+
+
 def export_mesh_instance(instance, depsgraph):
     obj = instance.object
     if obj.type not in GEOMETRY_TYPES:
@@ -326,25 +673,37 @@ def export_mesh_instance(instance, depsgraph):
     try:
         mesh.calc_loop_triangles()
         uv_layer = mesh.uv_layers.active.data if mesh.uv_layers.active else None
+        generated_bounds = mesh_generated_bounds(mesh)
         groups = {}
 
         for tri in mesh.loop_triangles:
             material_index = int(tri.material_index)
-            group = groups.setdefault(material_index, {
-                "vertices": [],
-                "indices": [],
-                "normals": [],
-                "uvs": [] if uv_layer is not None else None,
-            })
+            group = groups.get(material_index)
+            if group is None:
+                material_json = material_to_rt(material_for_slot(obj, material_index))
+                texture_coords = material_texture_coords(material_json)
+                if "generated" in texture_coords and "uv" in texture_coords:
+                    material_json["mixed_texture_coords"] = sorted(texture_coords)
+                group = {
+                    "vertices": [],
+                    "indices": [],
+                    "normals": [],
+                    "uvs": [],
+                    "material": material_json,
+                    "use_generated_uvs": texture_coords == {"generated"},
+                }
+                groups[material_index] = group
 
             for vertex_index, loop_index in zip(tri.vertices, tri.loops):
                 world_co = instance.matrix_world @ mesh.vertices[vertex_index].co
                 group["vertices"].append(rt_point(world_co))
                 group["indices"].append(len(group["indices"]))
                 group["normals"].append(transformed_normal(instance.matrix_world, mesh.loops[loop_index].normal))
-                if uv_layer is not None:
+                if uv_layer is not None and not group["use_generated_uvs"]:
                     uv = uv_layer[loop_index].uv
                     group["uvs"].append([float(uv.x), float(uv.y)])
+                else:
+                    group["uvs"].append(generated_uv(mesh, vertex_index, loop_index, generated_bounds))
 
         for material_index, group in groups.items():
             if not group["indices"]:
@@ -353,7 +712,7 @@ def export_mesh_instance(instance, depsgraph):
                 "type": "triangles",
                 "vertices": group["vertices"],
                 "indices": group["indices"],
-                "material": material_to_rt(material_for_slot(obj, material_index)),
+                "material": group["material"],
             }
             if group["uvs"] is not None:
                 item["uvs"] = group["uvs"]
