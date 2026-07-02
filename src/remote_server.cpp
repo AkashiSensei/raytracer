@@ -351,6 +351,7 @@ RenderOptions make_render_options(const std::map<std::string, std::string>& para
     options.direct_light_samples = std::max(1, query_int(params, "direct_light_samples", 1));
     options.emissive_light_samples = std::max(1, query_int(params, "emissive_light_samples", 1));
     options.auxiliary_buffers = query_bool(params, "aux_buffers", false);
+    options.specular_russian_roulette = query_bool(params, "specular_roulette", true);
     options.schedule = query_render_schedule(params);
     options.partial_update_interval = query_int(params, "partial_update_interval",
                                                 query_int(params, "partial_update_rows", 0));
@@ -389,6 +390,7 @@ std::vector<unsigned char> render_scene_body(const std::string& body,
               << " direct_only=" << (options.direct_only ? "true" : "false")
               << " direct_light_samples=" << options.direct_light_samples
               << " emissive_light_samples=" << options.emissive_light_samples
+              << " specular_roulette=" << (options.specular_russian_roulette ? "true" : "false")
               << " primitives=" << scene.primitive_count << "\n";
 
     RenderCallbacks callbacks;
@@ -437,6 +439,7 @@ EncodedRenderResult render_scene_body_full(const std::string& body,
               << " direct_light_samples=" << options.direct_light_samples
               << " emissive_light_samples=" << options.emissive_light_samples
               << " aux_buffers=" << (options.auxiliary_buffers ? "true" : "false")
+              << " specular_roulette=" << (options.specular_russian_roulette ? "true" : "false")
               << " primitives=" << scene.primitive_count << "\n";
 
     RenderCallbacks callbacks;

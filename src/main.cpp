@@ -27,6 +27,7 @@ void print_usage(const char* prog) {
               << "  --firefly-clamp <n> clamp per-sample radiance peak before accumulation\n"
               << "  --direct-light-samples <n> samples per analytic area light hit point (default: 1)\n"
               << "  --emissive-light-samples <n> samples per emissive object direct-light estimate (default: 1)\n"
+              << "  --disable-specular-roulette disable Russian roulette on deep specular paths\n"
               << "  --stats            print load/render timing and scene statistics\n"
               << "  --stats-format <m> stats output format: text or json (default: text)\n"
               << "  --direct-only      disable recursive random bounces, use direct light + shadows only\n"
@@ -89,6 +90,8 @@ int main(int argc, char* argv[]) {
             render_options.stats_format = argv[++i];
         } else if (arg == "--direct-only") {
             render_options.direct_only = true;
+        } else if (arg == "--disable-specular-roulette") {
+            render_options.specular_russian_roulette = false;
         } else if (arg == "--preview") {
             render_options.preview = true;
             render_options.direct_only = true;

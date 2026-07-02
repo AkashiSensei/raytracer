@@ -1134,6 +1134,8 @@ class LocalSubprocessRenderer(RendererClient):
             ])
         if settings.direct_only:
             cmd.append("--direct-only")
+        if not settings.specular_roulette:
+            cmd.append("--disable-specular-roulette")
         write_debug_text(debug_cache, "command.txt", " ".join(cmd) + "\n")
 
         process = subprocess.Popen(
@@ -1272,6 +1274,7 @@ class RemoteHttpRenderer(RendererClient):
             "direct_only": "1" if settings.direct_only else "0",
             "direct_light_samples": max(1, int(settings.direct_light_samples)),
             "emissive_light_samples": max(1, int(settings.emissive_light_samples)),
+            "specular_roulette": "1" if settings.specular_roulette else "0",
             "render_schedule": render_schedule_protocol(settings),
         }
         if settings.denoise:
@@ -1476,6 +1479,11 @@ class RaytracerSettings(bpy.types.PropertyGroup):
     max_depth: IntProperty(name="最大深度", default=16, min=1, max=256)
     threads: IntProperty(name="线程数", default=8, min=1, max=128)
     direct_only: BoolProperty(name="仅直接光照", default=False)
+    specular_roulette: BoolProperty(
+        name="镜面轮盘终止",
+        default=True,
+        description="第 5 次之后对玻璃/金属等镜面路径使用 Russian roulette；关闭后更便于观察其噪声影响",
+    )
     direct_light_samples: IntProperty(
         name="直接光采样",
         default=2,
@@ -1649,6 +1657,7 @@ class RENDER_PT_raytracer_settings(bpy.types.Panel):
         render_box.prop(settings, "max_depth")
         render_box.prop(settings, "threads")
         render_box.prop(settings, "direct_only")
+        render_box.prop(settings, "specular_roulette")
         render_box.prop(settings, "render_schedule")
         render_box.prop(settings, "progressive_preview")
         render_box.prop(settings, "denoise")

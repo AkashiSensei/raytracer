@@ -46,6 +46,7 @@ void print_usage(const char* prog) {
               << "  --partial-update-interval <n> rows or sample passes between preview snapshots\n"
               << "  --partial-update-rows <n> compatibility alias for row preview interval\n"
               << "  --direct-only        disable recursive random bounces\n"
+              << "  --disable-specular-roulette disable Russian roulette on deep specular paths\n"
               << "  --version            print bridge protocol version\n";
 }
 
@@ -105,6 +106,8 @@ bool parse_args(int argc, char* argv[], BridgeArgs& args) {
             }
         } else if (arg == "--direct-only") {
             args.render_options.direct_only = true;
+        } else if (arg == "--disable-specular-roulette") {
+            args.render_options.specular_russian_roulette = false;
         } else if (arg == "--version") {
             std::cout << "raytracer-blender-bridge protocol=1\n";
             std::exit(0);
@@ -187,6 +190,7 @@ int main(int argc, char* argv[]) {
               << " sample_pass_batch=" << args.render_options.sample_pass_batch
               << " direct_light_samples=" << args.render_options.direct_light_samples
               << " emissive_light_samples=" << args.render_options.emissive_light_samples
+              << " specular_roulette=" << (args.render_options.specular_russian_roulette ? "true" : "false")
               << " ambient=(" << scene.ambient_light.x << ","
               << scene.ambient_light.y << "," << scene.ambient_light.z << ")"
               << " environment=" << environment_type

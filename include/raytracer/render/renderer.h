@@ -33,6 +33,7 @@ struct RenderOptions {
     int direct_light_samples = 1;
     int emissive_light_samples = 1;
     bool auxiliary_buffers = false;
+    bool specular_russian_roulette = true;
     RenderSchedule schedule = RenderSchedule::Rows;
 };
 
@@ -446,7 +447,7 @@ inline Color ray_color(const Ray& r, const Scene& scene, int depth,
         if (!did_scatter) return emission;
 
         int bounces_done = scene.max_depth - depth;
-        bool rr_active = bounces_done >= 5;
+        bool rr_active = options.specular_russian_roulette && bounces_done >= 5;
         double p = 1.0;
         if (rr_active) {
             double lum = 0.2126 * attenuation.x + 0.7152 * attenuation.y + 0.0722 * attenuation.z;
