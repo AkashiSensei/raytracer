@@ -396,6 +396,23 @@ void test_camera_focal_length_orbit_and_framing_fields() {
           "camera focal_length/sensor_height should derive vertical FOV");
 
     {
+        std::ofstream out("/tmp/rt_camera_frame.json");
+        out << "{"
+            << "\"image\":{\"width\":100,\"height\":100},"
+            << "\"camera\":{"
+            << "\"lookfrom\":[0,0,0],\"lookat\":[0,0,-1],\"vfov\":90,"
+            << "\"frame\":{\"lower_left\":[-2,-1,-1],\"horizontal\":[4,0,0],\"vertical\":[0,2,0]}"
+            << "},"
+            << "\"objects\":[]"
+            << "}";
+    }
+    Scene frame_scene;
+    load_scene("/tmp/rt_camera_frame.json", frame_scene);
+    Ray right_edge = frame_scene.camera->get_ray(1.0, 0.5);
+    check(near_vec(right_edge.direction, Vec3(2, 0, -1), 1e-9),
+          "camera frame should override centered vfov projection for Blender framing");
+
+    {
         std::ofstream out("/tmp/rt_camera_orbit.json");
         out << "{"
             << "\"image\":{\"width\":100,\"height\":100},"

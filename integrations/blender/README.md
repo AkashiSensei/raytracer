@@ -152,7 +152,7 @@ Blender 插件只承诺导出渲染核心已经支持或可以合理近似的内
 
 | Blender 内容 | 导出内容 | 核心处理 | 备注 |
 |--------------|----------|----------|------|
-| 当前活动摄像机 | `camera.lookfrom/lookat/vup/vfov/focus_dist/aperture` | 生成 primary ray | 必须有 active camera |
+| 当前活动摄像机 | `camera.lookfrom/lookat/vup/vfov/focus_dist/aperture/frame` | 生成 primary ray | 必须有 active camera；优先使用 Blender `view_frame()` 导出的显式取景平面，使视角/缩放更接近 Cycles |
 | 分辨率与百分比 | `image.width/height` | 输出对应尺寸 RGBA32F | 使用 `render.resolution_percentage` 后的尺寸 |
 | 采样数 | `image.samples` | 每像素 Monte Carlo 采样 | `仅直接光照` 且 1 sample 时使用像素中心采样 |
 | 最大深度 | `image.max_depth` | 路径递归深度上限 | 对 `仅直接光照` 影响很小 |

@@ -195,11 +195,28 @@ def export_camera(scene, depsgraph, width, height):
     if focus_dist <= 0.0:
         focus_dist = 1.0
 
+    frame = camera_eval.data.view_frame(scene=scene)
+    world_frame = [matrix @ corner for corner in frame]
+    frame_center = sum(world_frame, Vector((0.0, 0.0, 0.0))) / 4.0
+    plane_dist = abs((frame_center - location).dot(forward.normalized()))
+    frame_scale = focus_dist / plane_dist if plane_dist > 1e-8 else 1.0
+
+    lower_left = location + (world_frame[2] - location) * frame_scale
+    lower_right = location + (world_frame[1] - location) * frame_scale
+    upper_left = location + (world_frame[3] - location) * frame_scale
+    horizontal = lower_right - lower_left
+    vertical = upper_left - lower_left
+
     return {
         "lookfrom": [float(lookfrom.x), float(lookfrom.y), float(lookfrom.z)],
         "lookat": [float(lookat.x), float(lookat.y), float(lookat.z)],
         "vup": [float(vup.x), float(vup.y), float(vup.z)],
         "vfov": float(vfov),
+        "frame": {
+            "lower_left": rt_point(lower_left),
+            "horizontal": rt_vector(horizontal),
+            "vertical": rt_vector(vertical),
+        },
         "aperture": float(camera_eval.data.dof.aperture_fstop if camera_eval.data.dof.use_dof else 0.0),
         "focus_dist": float(focus_dist),
     }

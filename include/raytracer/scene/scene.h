@@ -956,6 +956,23 @@ inline double camera_vfov_from_json(const JsonValue& c, double aspect, double fa
     return fallback;
 }
 
+inline bool camera_has_frame(const JsonValue& c) {
+    if (!c.has("frame")) return false;
+    const JsonValue& frame = c.at("frame");
+    return frame.has("lower_left") && frame.has("horizontal") && frame.has("vertical");
+}
+
+inline std::unique_ptr<Camera> make_frame_camera(const JsonValue& c, double aspect) {
+    const JsonValue& frame = c.at("frame");
+    Point3 lookfrom = to_vec3(c.at("lookfrom"));
+    Point3 lower_left = to_vec3(frame.at("lower_left"));
+    Vec3 horizontal = to_vec3(frame.at("horizontal"));
+    Vec3 vertical = to_vec3(frame.at("vertical"));
+    double vfov = camera_vfov_from_json(c, aspect, 60.0);
+    double aperture = c.has("aperture") ? c.at("aperture").numVal : 0.0;
+    return std::make_unique<Camera>(lookfrom, lower_left, horizontal, vertical, aperture, vfov);
+}
+
 inline Camera make_auto_camera(const AABB& bounds, double aspect, const JsonValue* camera_json) {
     double vfov = 35.0;
     double aperture = 0.0;
@@ -1051,6 +1068,10 @@ inline std::unique_ptr<Camera> build_camera(const JsonValue& root,
     }
 
     const JsonValue& c = *camera_json;
+    if (camera_has_frame(c)) {
+        return make_frame_camera(c, aspect);
+    }
+
     Point3 lookfrom = to_vec3(c.at("lookfrom"));
     Point3 lookat   = to_vec3(c.at("lookat"));
     Vec3   vup      = c.has("vup") ? to_vec3(c.at("vup")) : Vec3(0, 1, 0);

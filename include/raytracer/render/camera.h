@@ -30,6 +30,20 @@ public:
         u_ = u; v_ = v;
     }
 
+    Camera(Point3 lookfrom, Point3 lower_left, Vec3 horizontal, Vec3 vertical,
+           double aperture, double vfov_deg)
+        : lookfrom_(lookfrom),
+          lookat_(lower_left + 0.5 * horizontal + 0.5 * vertical),
+          origin_(lookfrom),
+          lower_left_(lower_left),
+          horizontal_(horizontal),
+          vertical_(vertical),
+          lens_radius_(aperture / 2),
+          vfov_degrees_(vfov_deg) {
+        u_ = horizontal.length_squared() > 1e-12 ? horizontal.normalized() : Vec3(1, 0, 0);
+        v_ = vertical.length_squared() > 1e-12 ? vertical.normalized() : Vec3(0, 1, 0);
+    }
+
     Ray get_ray(double s, double t) const {
         Vec3 rd = lens_radius_ * random_in_unit_disk();
         Vec3 offset = u_ * rd.x + v_ * rd.y;
