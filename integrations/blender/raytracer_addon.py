@@ -1050,6 +1050,8 @@ def denoise_pixels(pixels, settings, debug_cache=None, label="preview", albedo=N
             write_rgb_pfm(albedo_pfm, albedo)
             write_rgb_pfm(normal_pfm, normal)
             cmd.extend(["--alb", str(albedo_pfm), "--nrm", str(normal_pfm)])
+            if getattr(settings, "denoise_clean_aux_final", False) and label in ("final", "remote_final"):
+                cmd.append("--clean_aux")
         write_debug_text(debug_cache, "denoise_%s_command.txt" % label, " ".join(cmd) + "\n")
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         write_debug_text(debug_cache, "denoise_%s_stdout.log" % label, result.stdout)
@@ -1507,6 +1509,11 @@ class RaytracerSettings(bpy.types.PropertyGroup):
         default=False,
         description="对全图累积预览和最终 Render Result 应用 Open Image Denoise；不会写回采样累计缓冲",
     )
+    denoise_clean_aux_final: BoolProperty(
+        name="最终 cleanAux",
+        default=False,
+        description="仅最终 Render Result 使用 OIDN clean_aux；预览和 partial 仍保持普通辅助图降噪",
+    )
     light_intensity_scale: FloatProperty(
         name="灯光强度倍率",
         default=0.03,
@@ -1645,6 +1652,8 @@ class RENDER_PT_raytracer_settings(bpy.types.Panel):
         render_box.prop(settings, "render_schedule")
         render_box.prop(settings, "progressive_preview")
         render_box.prop(settings, "denoise")
+        if settings.denoise:
+            render_box.prop(settings, "denoise_clean_aux_final")
 
         lighting_box = layout.box()
         lighting_box.label(text="光照")
