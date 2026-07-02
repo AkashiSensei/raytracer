@@ -122,6 +122,7 @@ POST /jobs/<job_id>/cancel
 | `灯光强度倍率` | Blender 光照导出为 raytracer 内部光照强度前应用的倍率，默认 `0.03` |
 | `背景` | Blender 路径显式导出的背景。默认 `黑色`，也可选 `World 表面`、`自定义颜色` 或 raytracer 内置 `天空` |
 | `环境光` | 简单全局补光开关。默认关闭；开启后按 `环境光颜色 * 环境光强度 * 灯光强度倍率` 导出，环境光强度默认 `5.0` |
+| `面光源相机可见` | 控制 Blender Area Light 是否能被相机直接看到。默认关闭；面光源默认仍会在玻璃、金属等 specular/glossy 路径中可见 |
 | `调试缓存` | 可选目录。填写后每次渲染会在该目录下创建一个 `raytracer_...` 子目录，保存中间 JSON、日志和结果文件 |
 
 Blender 路径不会触发 CLI 的默认天空、默认灯光或默认环境光。插件会显式导出：
@@ -193,11 +194,12 @@ Blender 路径会显式导出 `background`、`lighting.ambient` 和 `lights`，�
 | Point | `lights[].type = "point"`，位置、颜色、`energy * 灯光强度倍率` | 点光源，平方距离衰减，发阴影射线 | 位置会影响照明 |
 | Sun | `lights[].type = "directional"`，方向、颜色、`energy * 灯光强度倍率` | 方向光，无距离衰减，发阴影射线 | 只使用旋转方向，移动位置无影响 |
 | Spot | 近似导出为 point，强度为 `energy * 灯光强度倍率` | 当点光源处理 | 当前不支持锥角、半影 |
-| Area | 近似导出为 point，强度为 `energy * 灯光强度倍率` | 当点光源处理 | 不是真正面光源采样 |
+| Area Square / Rectangle | `lights[].type = "rect"`，中心、方向、`u/v` 尺寸向量、颜色、强度、可见性标记 | 解析矩形面光源，支持面积采样、软阴影和 specular 命中 | 默认相机不可见、specular 可见；`面光源相机可见` 可让相机直接看到灯面 |
+| Area Disk / Ellipse | `lights[].type = "disk"`，中心、方向、半径、颜色、强度、可见性标记 | 解析圆盘面光源，支持面积采样、软阴影和 specular 命中 | Ellipse 当前按等面积近似为圆盘 |
 | 禁用渲染的灯 | 不导出 | 无贡献 | 读取 `hide_render` |
 | 发光材质 | `emissive` 材质 | 作为自发光表面，可参与路径追踪 | 这是材质贡献，不是 Blender Light 对象 |
 
-核心直接光照会遍历点光/方向光并发阴影射线；被遮挡的光源不会给当前命中点贡献直接光照。真正的面光源、体积光、IES、灯光半径/柔和阴影、spot cone 暂不支持。
+核心直接光照会遍历点光/方向光/解析面光源并发阴影射线；被遮挡的光源不会给当前命中点贡献直接光照。Area Light 会按面积采样形成软阴影，也可以被 specular/glossy 反射或折射路径命中。体积光、IES、点/聚光灯半径、spot cone 暂不支持。
 
 `灯光强度倍率` 是 Blender 接入层的单位标定。渲染核心仍使用自己的内部光照单位；插件负责把 Blender 的灯光 `energy` 和插件环境光强度映射到该内部单位。默认 `0.03` 是为了让 Blender 常见点光能量在当前简化光照模型里更接近可调试范围。若希望更接近某个 EEVEE/Cycles 参考图，可以直接调这个倍率，并在 `调试缓存/scene.rt.json` 中查看最终导出的 `lights[].intensity` 和 `lighting.ambient`。
 

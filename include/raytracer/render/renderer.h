@@ -36,6 +36,118 @@ struct RenderOutput {
     std::vector<Color> pixels;
 };
 
+enum class RayPathType {
+    Camera,
+    Specular,
+    Diffuse
+};
+
+struct VisibleLightHit {
+    double t = infinity;
+    Color emission = Color(0, 0, 0);
+};
+
+inline bool light_visible_to_path(const Light& light, RayPathType path_type) {
+    if (path_type == RayPathType::Camera) return light.visible_camera;
+    if (path_type == RayPathType::Specular) return light.visible_specular;
+    return light.visible_diffuse;
+}
+
+inline bool hit_rect_light(const Light& light, const Ray& ray, double t_min, double t_max, double& t_out) {
+    Vec3 plane_normal = cross(light.u, light.v);
+    if (plane_normal.length_squared() <= 1e-12) return false;
+    plane_normal = plane_normal.normalized();
+
+    double denom = dot(plane_normal, ray.direction);
+    if (std::fabs(denom) <= 1e-10) return false;
+
+    double t = dot(light.position - ray.origin, plane_normal) / denom;
+    if (t <= t_min || t >= t_max) return false;
+
+    Vec3 view_from_light = -ray.direction.normalized();
+    if (dot(safe_normalized(light.direction, plane_normal), view_from_light) <= 0.0) return false;
+
+    Point3 p = ray.at(t);
+    Vec3 rel = p - light.position;
+    double u_len2 = light.u.length_squared();
+    double v_len2 = light.v.length_squared();
+    if (u_len2 <= 1e-12 || v_len2 <= 1e-12) return false;
+    double u_coord = dot(rel, light.u) / u_len2;
+    double v_coord = dot(rel, light.v) / v_len2;
+    if (std::fabs(u_coord) > 0.5 || std::fabs(v_coord) > 0.5) return false;
+
+    t_out = t;
+    return true;
+}
+
+inline bool hit_disk_light(const Light& light, const Ray& ray, double t_min, double t_max, double& t_out) {
+    Vec3 plane_normal = safe_normalized(light.direction, Vec3(0, -1, 0));
+    double denom = dot(plane_normal, ray.direction);
+    if (std::fabs(denom) <= 1e-10) return false;
+
+    double t = dot(light.position - ray.origin, plane_normal) / denom;
+    if (t <= t_min || t >= t_max) return false;
+
+    Vec3 view_from_light = -ray.direction.normalized();
+    if (dot(plane_normal, view_from_light) <= 0.0) return false;
+
+    Vec3 rel = ray.at(t) - light.position;
+    double along_normal = dot(rel, plane_normal);
+    Vec3 radial = rel - along_normal * plane_normal;
+    if (radial.length_squared() > light.radius * light.radius) return false;
+
+    t_out = t;
+    return true;
+}
+
+inline bool hit_sphere_light(const Light& light, const Ray& ray, double t_min, double t_max, double& t_out) {
+    Vec3 oc = ray.origin - light.position;
+    double a = ray.direction.length_squared();
+    double half_b = dot(oc, ray.direction);
+    double c = oc.length_squared() - light.radius * light.radius;
+    double discriminant = half_b * half_b - a * c;
+    if (discriminant < 0) return false;
+    double sqrtd = std::sqrt(discriminant);
+
+    double root = (-half_b - sqrtd) / a;
+    if (root <= t_min || root >= t_max) {
+        root = (-half_b + sqrtd) / a;
+        if (root <= t_min || root >= t_max) return false;
+    }
+
+    t_out = root;
+    return true;
+}
+
+inline bool hit_visible_analytic_light(const Scene& scene,
+                                       const Ray& ray,
+                                       RayPathType path_type,
+                                       double t_max,
+                                       VisibleLightHit& hit) {
+    bool found = false;
+    double closest = t_max;
+    for (const Light& light : scene.lights) {
+        if (!light_visible_to_path(light, path_type)) continue;
+
+        double t = infinity;
+        bool light_hit = false;
+        if (light.type == LightType::Rect) {
+            light_hit = hit_rect_light(light, ray, 0.001, closest, t);
+        } else if (light.type == LightType::Disk) {
+            light_hit = hit_disk_light(light, ray, 0.001, closest, t);
+        } else if (light.type == LightType::Sphere) {
+            light_hit = hit_sphere_light(light, ray, 0.001, closest, t);
+        }
+
+        if (!light_hit) continue;
+        closest = t;
+        hit.t = t;
+        hit.emission = light.color * light.intensity;
+        found = true;
+    }
+    return found;
+}
+
 inline bool is_shadowed(const Hittable& world, const Ray& shadow_ray, double max_t) {
     Ray ray = shadow_ray;
     double remaining_t = max_t;
@@ -108,11 +220,19 @@ inline Color direct_delta_lights(const Ray& r_in, const HitRecord& rec, const Sc
 inline Color ray_color(const Ray& r, const Scene& scene, int depth,
                        const RenderOptions& options,
                        double prev_pdf,
-                       bool prev_brdf) {
+                       bool prev_brdf,
+                       RayPathType path_type = RayPathType::Camera) {
     if (depth <= 0) return Color(0, 0, 0);
 
     HitRecord rec;
-    if (!scene.world->hit(r, 0.001, infinity, rec)) {
+    bool hit_world = scene.world->hit(r, 0.001, infinity, rec);
+    double world_t = hit_world ? rec.t : infinity;
+    VisibleLightHit light_hit;
+    if (hit_visible_analytic_light(scene, r, path_type, world_t, light_hit)) {
+        return light_hit.emission;
+    }
+
+    if (!hit_world) {
         return scene_background(scene, r);
     }
 
@@ -142,7 +262,7 @@ inline Color ray_color(const Ray& r, const Scene& scene, int depth,
             // across alpha-mask cutouts (e.g. a leaf inside a glass vase).
             continue_ray.medium_color = r.medium_color;
             continue_ray.medium_attenuation_distance = r.medium_attenuation_distance;
-            return ray_color(continue_ray, scene, depth, options, prev_pdf, prev_brdf);
+            return ray_color(continue_ray, scene, depth, options, prev_pdf, prev_brdf, path_type);
         }
     }
 
@@ -171,7 +291,7 @@ inline Color ray_color(const Ray& r, const Scene& scene, int depth,
             if (random_double() > p) return emission;
         }
 
-        Color child = ray_color(scattered, scene, depth - 1, options, 1.0, true);
+        Color child = ray_color(scattered, scene, depth - 1, options, 1.0, true, RayPathType::Specular);
         if (rr_active) child = child / p;
         return emission + attenuation * child;
     }
@@ -216,11 +336,11 @@ inline Color ray_color(const Ray& r, const Scene& scene, int depth,
     Color f_val = rec.material->f(r, scattered, rec);
     if (brdf_pdf <= 0) {
         return emission + direct +
-               attenuation * ray_color(scattered, scene, depth - 1, options, 1.0, true);
+               attenuation * ray_color(scattered, scene, depth - 1, options, 1.0, true, RayPathType::Diffuse);
     }
 
     Color indirect = f_val * dot(rec.normal, scattered.direction) / brdf_pdf
-                   * ray_color(scattered, scene, depth - 1, options, brdf_pdf, true);
+                   * ray_color(scattered, scene, depth - 1, options, brdf_pdf, true, RayPathType::Diffuse);
 
     return emission + direct + indirect;
 }

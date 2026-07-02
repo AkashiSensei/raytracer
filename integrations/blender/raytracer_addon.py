@@ -266,12 +266,41 @@ def export_lights(depsgraph, settings):
                 "intensity": intensity,
             })
         elif data.type == "AREA":
-            lights.append({
-                "type": "point",
-                "position": rt_point(matrix.to_translation()),
-                "color": color,
-                "intensity": intensity,
-            })
+            rotation = matrix.to_quaternion()
+            shape = getattr(data, "shape", "SQUARE")
+            size_x = max(1e-6, float(getattr(data, "size", 1.0)))
+            size_y = max(1e-6, float(getattr(data, "size_y", size_x)))
+            direction = rotation @ Vector((0.0, 0.0, -1.0))
+            if shape in {"DISK", "ELLIPSE"}:
+                radius = 0.5 * size_x
+                if shape == "ELLIPSE":
+                    radius = 0.5 * math.sqrt(size_x * size_y)
+                lights.append({
+                    "type": "disk",
+                    "position": rt_point(matrix.to_translation()),
+                    "direction": rt_vector(direction),
+                    "radius": radius,
+                    "color": color,
+                    "intensity": intensity,
+                    "visible_camera": bool(settings.area_light_camera_visible),
+                    "visible_specular": True,
+                })
+            else:
+                if shape == "SQUARE":
+                    size_y = size_x
+                u = rotation @ Vector((size_x, 0.0, 0.0))
+                v = rotation @ Vector((0.0, size_y, 0.0))
+                lights.append({
+                    "type": "rect",
+                    "position": rt_point(matrix.to_translation()),
+                    "direction": rt_vector(direction),
+                    "u": rt_vector(u),
+                    "v": rt_vector(v),
+                    "color": color,
+                    "intensity": intensity,
+                    "visible_camera": bool(settings.area_light_camera_visible),
+                    "visible_specular": True,
+                })
     return lights
 
 
@@ -794,6 +823,11 @@ class RaytracerSettings(bpy.types.PropertyGroup):
         precision=4,
         description="Blender 灯光 energy 导出为 raytracer intensity 前应用的倍率",
     )
+    area_light_camera_visible: BoolProperty(
+        name="面光源相机可见",
+        default=False,
+        description="开启后 Blender Area Light 会被相机直接看见；默认仍会在玻璃和金属反射中可见",
+    )
     background_mode: EnumProperty(
         name="背景",
         items=[
@@ -888,6 +922,7 @@ class RENDER_PT_raytracer_settings(bpy.types.Panel):
         lighting_box = layout.box()
         lighting_box.label(text="光照")
         lighting_box.prop(settings, "light_intensity_scale")
+        lighting_box.prop(settings, "area_light_camera_visible")
         lighting_box.prop(settings, "ambient_enabled")
         if settings.ambient_enabled:
             lighting_box.prop(settings, "ambient_color")

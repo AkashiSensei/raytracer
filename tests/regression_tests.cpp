@@ -333,6 +333,8 @@ void test_extended_light_types_parse() {
     Light rect_light = parse_light(rect);
     check(rect_light.type == LightType::Rect, "rect light should parse as rectangular area light");
     check(near(rect_light.area(), 2.0), "rect light area should come from u cross v");
+    check(!rect_light.visible_camera && rect_light.visible_specular,
+          "area lights should default to camera-hidden and specular-visible");
 
     JsonValue sphere;
     sphere.type = JsonValue::Object;
@@ -379,6 +381,48 @@ void test_extended_light_sampling_outputs_radiance() {
           "spot light should illuminate points inside its cone");
     check(sample_scene_light(spot_light, Point3(2, 0, 0)).radiance.length_squared() == 0.0,
           "spot light should reject points outside its cone");
+}
+
+void test_analytic_area_light_visibility_for_camera_and_specular_rays() {
+    {
+        std::ofstream out("/tmp/rt_area_light_visibility.json");
+        out << "{"
+            << "\"image\":{\"width\":16,\"height\":16,\"samples\":1},"
+            << "\"background\":{\"type\":\"solid\",\"color\":[0,0,0]},"
+            << "\"lighting\":{\"ambient\":[0,0,0]},"
+            << "\"camera\":{\"lookfrom\":[0,0,0],\"lookat\":[0,0,-1],\"vfov\":60},"
+            << "\"lights\":[{\"type\":\"rect\",\"position\":[0,0,-2],\"direction\":[0,0,1],"
+            << "\"u\":[2,0,0],\"v\":[0,2,0],\"color\":[1,0.5,0.25],\"intensity\":3}],"
+            << "\"objects\":[]"
+            << "}";
+    }
+    Scene hidden_scene;
+    load_scene("/tmp/rt_area_light_visibility.json", hidden_scene);
+    RenderOptions options;
+    Ray ray(Point3(0, 0, 0), Vec3(0, 0, -1));
+    Color camera_hit = ray_color(ray, hidden_scene, 4, options, infinity, false, RayPathType::Camera);
+    check(near_vec(camera_hit, Color(0, 0, 0), 1e-9),
+          "area light should be hidden from camera rays by default");
+    Color specular_hit = ray_color(ray, hidden_scene, 4, options, infinity, false, RayPathType::Specular);
+    check(near_vec(specular_hit, Color(3, 1.5, 0.75), 1e-9),
+          "area light should be visible to specular rays by default");
+
+    {
+        std::ofstream out("/tmp/rt_area_light_camera_visible.json");
+        out << "{"
+            << "\"image\":{\"width\":16,\"height\":16,\"samples\":1},"
+            << "\"background\":{\"type\":\"solid\",\"color\":[0,0,0]},"
+            << "\"camera\":{\"lookfrom\":[0,0,0],\"lookat\":[0,0,-1],\"vfov\":60},"
+            << "\"lights\":[{\"type\":\"rect\",\"position\":[0,0,-2],\"direction\":[0,0,1],"
+            << "\"u\":[2,0,0],\"v\":[0,2,0],\"intensity\":2,\"visible_camera\":true}],"
+            << "\"objects\":[]"
+            << "}";
+    }
+    Scene visible_scene;
+    load_scene("/tmp/rt_area_light_camera_visible.json", visible_scene);
+    Color visible_camera_hit = ray_color(ray, visible_scene, 4, options, infinity, false, RayPathType::Camera);
+    check(near_vec(visible_camera_hit, Color(2, 2, 2), 1e-9),
+          "visible_camera=true should make analytic area lights visible to camera rays");
 }
 
 void test_camera_focal_length_orbit_and_framing_fields() {
@@ -952,6 +996,7 @@ int main() {
     test_environment_solid_and_gradient_backgrounds();
     test_extended_light_types_parse();
     test_extended_light_sampling_outputs_radiance();
+    test_analytic_area_light_visibility_for_camera_and_specular_rays();
     test_camera_focal_length_orbit_and_framing_fields();
     test_scene_preset_and_render_block_are_accepted();
     test_firefly_clamp_preserves_hue_by_scaling();

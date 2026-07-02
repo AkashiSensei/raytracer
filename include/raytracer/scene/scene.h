@@ -45,6 +45,9 @@ struct Light {
     double radius = 0.25;
     double angle = 30.0;
     double soft_angle = 0.0;
+    bool visible_camera = false;
+    bool visible_specular = true;
+    bool visible_diffuse = false;
 
     double area() const {
         if (type == LightType::Sphere) return 4.0 * pi * radius * radius;
@@ -544,6 +547,9 @@ inline Light parse_light(const JsonValue& light_json) {
 
     if (light_json.has("color")) light.color = to_vec3(light_json.at("color"));
     if (light_json.has("intensity")) light.intensity = light_json.at("intensity").numVal;
+    if (light_json.has("visible_camera")) light.visible_camera = light_json.at("visible_camera").boolVal;
+    if (light_json.has("visible_specular")) light.visible_specular = light_json.at("visible_specular").boolVal;
+    if (light_json.has("visible_diffuse")) light.visible_diffuse = light_json.at("visible_diffuse").boolVal;
     return light;
 }
 
