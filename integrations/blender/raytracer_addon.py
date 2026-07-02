@@ -1024,7 +1024,7 @@ def read_rgb_pfm(path, width, height):
     return rgb
 
 
-def denoise_pixels(pixels, settings, debug_cache=None, label="preview"):
+def denoise_pixels(pixels, settings, debug_cache=None, label="preview", albedo=None, normal=None):
     if not settings.denoise:
         return pixels
 
@@ -1035,6 +1035,8 @@ def denoise_pixels(pixels, settings, debug_cache=None, label="preview"):
     with tempfile.TemporaryDirectory(prefix="raytracer_oidn_") as tmp:
         tmp_path = Path(tmp)
         input_pfm = tmp_path / "input.pfm"
+        albedo_pfm = tmp_path / "albedo.pfm"
+        normal_pfm = tmp_path / "normal.pfm"
         output_pfm = tmp_path / "output.pfm"
         write_rgb_pfm(input_pfm, pixels)
         cmd = [
@@ -1044,6 +1046,10 @@ def denoise_pixels(pixels, settings, debug_cache=None, label="preview"):
             "--threads", str(max(1, int(settings.threads))),
             "-o", str(output_pfm),
         ]
+        if albedo is not None and normal is not None:
+            write_rgb_pfm(albedo_pfm, albedo)
+            write_rgb_pfm(normal_pfm, normal)
+            cmd.extend(["--alb", str(albedo_pfm), "--nrm", str(normal_pfm)])
         write_debug_text(debug_cache, "denoise_%s_command.txt" % label, " ".join(cmd) + "\n")
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         write_debug_text(debug_cache, "denoise_%s_stdout.log" % label, result.stdout)
@@ -1063,10 +1069,15 @@ def denoise_pixels(pixels, settings, debug_cache=None, label="preview"):
     return RenderPixels(pixels.width, pixels.height, denoised)
 
 
-def denoise_preview_pixels(pixels, settings, debug_cache=None, label="preview"):
+def denoise_preview_pixels(pixels, settings, debug_cache=None, label="preview", albedo=None, normal=None):
     if settings.render_schedule != "SAMPLE_PASSES":
         return pixels
-    return denoise_pixels(pixels, settings, debug_cache, label)
+    return denoise_pixels(pixels, settings, debug_cache, label, albedo, normal)
+
+
+def aux_path_for_color(path, suffix):
+    p = Path(path)
+    return p.with_name(p.stem + suffix + p.suffix)
 
 
 class RendererClient:
@@ -1093,6 +1104,8 @@ class LocalSubprocessRenderer(RendererClient):
     def render_in_directory(self, package, engine, settings, work_dir, debug_cache=None):
         scene_path = Path(work_dir) / "scene.rt.json"
         result_path = Path(work_dir) / "result.rgba32f"
+        result_albedo_path = Path(work_dir) / "result_albedo.rgba32f"
+        result_normal_path = Path(work_dir) / "result_normal.rgba32f"
         if not scene_path.exists():
             with scene_path.open("w", encoding="utf-8") as f:
                 json.dump(package, f, separators=(",", ":"))
@@ -1106,6 +1119,11 @@ class LocalSubprocessRenderer(RendererClient):
             "--emissive-light-samples", str(max(1, int(settings.emissive_light_samples))),
             "--render-schedule", render_schedule_protocol(settings),
         ]
+        if settings.denoise:
+            cmd.extend([
+                "--out-albedo-float", str(result_albedo_path),
+                "--out-normal-float", str(result_normal_path),
+            ])
         if settings.progressive_preview:
             partial_dir = Path(work_dir) / "partials"
             cmd.extend([
@@ -1142,8 +1160,16 @@ class LocalSubprocessRenderer(RendererClient):
                         try:
                             parts = line.split(" ", 2)
                             progress = float(parts[1])
+                            partial_path = Path(parts[2].strip())
+                            albedo = normal = None
+                            if settings.denoise:
+                                albedo_path = aux_path_for_color(partial_path, "_albedo")
+                                normal_path = aux_path_for_color(partial_path, "_normal")
+                                if albedo_path.exists() and normal_path.exists():
+                                    albedo = read_rgba32f(albedo_path)
+                                    normal = read_rgba32f(normal_path)
                             pixels = denoise_preview_pixels(
-                                read_rgba32f(parts[2].strip()), settings, debug_cache, "partial"
+                                read_rgba32f(partial_path), settings, debug_cache, "partial", albedo, normal
                             )
                             engine.update_render_pixels(pixels)
                             engine.update_progress(max(0.0, min(0.98, progress)))
@@ -1165,7 +1191,11 @@ class LocalSubprocessRenderer(RendererClient):
                     details += "\n" + stdout.strip()
                 raise RuntimeError("Raytracer bridge failed\n" + details)
 
-            return denoise_pixels(read_rgba32f(result_path), settings, debug_cache, "final")
+            albedo = normal = None
+            if settings.denoise and result_albedo_path.exists() and result_normal_path.exists():
+                albedo = read_rgba32f(result_albedo_path)
+                normal = read_rgba32f(result_normal_path)
+            return denoise_pixels(read_rgba32f(result_path), settings, debug_cache, "final", albedo, normal)
         finally:
             if process.poll() is None:
                 process.terminate()
@@ -1242,6 +1272,8 @@ class RemoteHttpRenderer(RendererClient):
             "emissive_light_samples": max(1, int(settings.emissive_light_samples)),
             "render_schedule": render_schedule_protocol(settings),
         }
+        if settings.denoise:
+            render_params["aux_buffers"] = "1"
         if settings.progressive_preview:
             render_params["partial_update_interval"] = progressive_update_interval(package, settings)
         params = urllib.parse.urlencode(render_params)
@@ -1271,7 +1303,11 @@ class RemoteHttpRenderer(RendererClient):
         quoted_job_id = urllib.parse.quote(job_id, safe="")
         progress_url = self.url("/jobs/" + quoted_job_id + "/progress")
         partial_url = self.url("/jobs/" + quoted_job_id + "/partial")
+        partial_albedo_url = self.url("/jobs/" + quoted_job_id + "/partial-albedo")
+        partial_normal_url = self.url("/jobs/" + quoted_job_id + "/partial-normal")
         result_url = self.url("/jobs/" + quoted_job_id + "/result")
+        albedo_url = self.url("/jobs/" + quoted_job_id + "/albedo")
+        normal_url = self.url("/jobs/" + quoted_job_id + "/normal")
         engine.update_progress(0.0)
         progress_lines = []
         last_partial_seq = 0
@@ -1298,7 +1334,19 @@ class RemoteHttpRenderer(RendererClient):
                         partial = response.read()
                     last_partial_seq = partial_seq
                     write_debug_bytes(debug_cache, "remote_partial_%06d.rgba32f" % partial_seq, partial)
-                    pixels = denoise_preview_pixels(parse_rgba32f(partial), settings, debug_cache, "remote_partial")
+                    albedo = normal = None
+                    if settings.denoise:
+                        try:
+                            with urllib.request.urlopen(partial_albedo_url, timeout=self.request_timeout(deadline)) as response:
+                                albedo = parse_rgba32f(response.read())
+                            with urllib.request.urlopen(partial_normal_url, timeout=self.request_timeout(deadline)) as response:
+                                normal = parse_rgba32f(response.read())
+                        except urllib.error.HTTPError as exc:
+                            if exc.code not in (202, 404):
+                                raise
+                    pixels = denoise_preview_pixels(
+                        parse_rgba32f(partial), settings, debug_cache, "remote_partial", albedo, normal
+                    )
                     engine.update_render_pixels(pixels)
                 except urllib.error.HTTPError as exc:
                     if exc.code not in (202, 404):
@@ -1334,7 +1382,17 @@ class RemoteHttpRenderer(RendererClient):
 
         engine.update_progress(0.99)
         write_debug_bytes(debug_cache, "result.rgba32f", result)
-        return denoise_pixels(parse_rgba32f(result), settings, debug_cache, "remote_final")
+        albedo = normal = None
+        if settings.denoise:
+            try:
+                with urllib.request.urlopen(albedo_url, timeout=self.request_timeout(deadline)) as response:
+                    albedo = parse_rgba32f(response.read())
+                with urllib.request.urlopen(normal_url, timeout=self.request_timeout(deadline)) as response:
+                    normal = parse_rgba32f(response.read())
+            except urllib.error.HTTPError as exc:
+                if exc.code not in (404,):
+                    raise
+        return denoise_pixels(parse_rgba32f(result), settings, debug_cache, "remote_final", albedo, normal)
 
 
 def parse_rgba32f(data):

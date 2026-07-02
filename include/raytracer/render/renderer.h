@@ -32,6 +32,7 @@ struct RenderOptions {
     int sample_pass_batch = 16;
     int direct_light_samples = 1;
     int emissive_light_samples = 1;
+    bool auxiliary_buffers = false;
     RenderSchedule schedule = RenderSchedule::Rows;
 };
 
@@ -41,6 +42,8 @@ struct RenderOutput {
     int samples = 1;
     bool cancelled = false;
     std::vector<Color> pixels;
+    std::vector<Color> albedo_pixels;
+    std::vector<Color> normal_pixels;
 };
 
 struct RenderProgressInfo {
@@ -240,6 +243,66 @@ inline uint64_t render_sample_seed(uint64_t base_seed, int x, int y, int sample_
     h ^= (static_cast<uint64_t>(static_cast<uint32_t>(sample_index)) + 0x94d049bb133111ebULL) +
          (h << 6) + (h >> 2);
     return h;
+}
+
+inline Color clamp_auxiliary_albedo(const Color& c) {
+    return Color(std::clamp(c.x, 0.0, 1.0),
+                 std::clamp(c.y, 0.0, 1.0),
+                 std::clamp(c.z, 0.0, 1.0));
+}
+
+inline Ray specular_auxiliary_ray(const Ray& r_in, const HitRecord& rec) {
+    Vec3 dir = r_in.direction.normalized();
+    if (rec.material && rec.material->is_transparent()) {
+        const Dielectric* dielectric = dynamic_cast<const Dielectric*>(rec.material);
+        double ior = dielectric ? dielectric->ior : 1.5;
+        double ratio = rec.front_face ? (1.0 / ior) : ior;
+        double cos_theta = std::fmin(dot(-dir, rec.normal), 1.0);
+        double sin_theta = std::sqrt(std::max(0.0, 1.0 - cos_theta * cos_theta));
+        if (ratio * sin_theta <= 1.0) {
+            dir = refract(dir, rec.normal, ratio).normalized();
+        } else {
+            dir = reflect(dir, rec.normal).normalized();
+        }
+    } else {
+        dir = reflect(dir, rec.normal).normalized();
+    }
+    return Ray(rec.p + 0.001 * dir, dir);
+}
+
+inline void trace_auxiliary_buffers(const Ray& camera_ray,
+                                    const Scene& scene,
+                                    int max_depth,
+                                    Color& albedo,
+                                    Color& normal) {
+    Ray ray = camera_ray;
+    albedo = Color(1, 1, 1);
+    normal = Color(0, 0, 0);
+
+    for (int depth = 0; depth < max_depth; depth++) {
+        HitRecord rec;
+        if (!scene.world->hit(ray, 0.001, infinity, rec)) return;
+
+        if (rec.material && rec.material->is_alpha_masked()) {
+            Color bc = rec.material->base_color(rec);
+            double alpha = std::max({bc.x, bc.y, bc.z});
+            if (alpha < rec.material->alpha_cutoff()) {
+                Vec3 continue_dir = ray.direction.normalized();
+                ray = Ray(rec.p + 0.001 * continue_dir, ray.direction);
+                continue;
+            }
+        }
+
+        if (rec.material && rec.material->is_specular()) {
+            ray = specular_auxiliary_ray(ray, rec);
+            continue;
+        }
+
+        albedo = clamp_auxiliary_albedo(
+            rec.material ? rec.material->base_color(rec) : Color(0.8, 0.8, 0.8));
+        normal = rec.normal.length_squared() > 1e-12 ? rec.normal.normalized() : Color(0, 0, 0);
+        return;
+    }
 }
 
 inline const EmissiveObject* sample_emissive_by_area(const Scene& scene,
@@ -469,6 +532,10 @@ inline RenderOutput render_scene(const Scene& scene,
     output.samples = scene.samples;
     output.pixels.assign(static_cast<size_t>(scene.width) * static_cast<size_t>(scene.height),
                          Color(0, 0, 0));
+    if (options.auxiliary_buffers) {
+        output.albedo_pixels.assign(output.pixels.size(), Color(0, 0, 0));
+        output.normal_pixels.assign(output.pixels.size(), Color(0, 0, 0));
+    }
 
     auto render_start_time = std::chrono::steady_clock::now();
     int thread_count = resolve_thread_count(scene, options);
@@ -583,8 +650,14 @@ inline RenderOutput render_scene(const Scene& scene,
 
                 int sample_row = scene.height - 1 - j;
                 std::vector<Color> row_pixels;
+                std::vector<Color> row_albedo;
+                std::vector<Color> row_normal;
                 if (partial_enabled) {
                     row_pixels.assign(static_cast<size_t>(scene.width), Color(0, 0, 0));
+                    if (options.auxiliary_buffers) {
+                        row_albedo.assign(static_cast<size_t>(scene.width), Color(0, 0, 0));
+                        row_normal.assign(static_cast<size_t>(scene.width), Color(0, 0, 0));
+                    }
                 }
                 bool row_cancelled = false;
                 for (int i = 0; i < scene.width; i++) {
@@ -603,9 +676,22 @@ inline RenderOutput render_scene(const Scene& scene,
                         double offset_y = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
                         double u = (i + offset_x) / std::max(1, scene.width - 1);
                         double v = (sample_row + offset_y) / std::max(1, scene.height - 1);
-                        Color sample = ray_color(
-                            scene.camera->get_ray(u, v), scene, scene.max_depth, options, infinity, false);
+                        Ray camera_ray = scene.camera->get_ray(u, v);
+                        Color sample = ray_color(camera_ray, scene, scene.max_depth, options, infinity, false);
                         col += clamp_radiance(sample, scene.firefly_clamp);
+                        if (options.auxiliary_buffers) {
+                            Color albedo, normal;
+                            trace_auxiliary_buffers(camera_ray, scene, scene.max_depth, albedo, normal);
+                            if (partial_enabled) {
+                                row_albedo[static_cast<size_t>(i)] += albedo;
+                                row_normal[static_cast<size_t>(i)] += normal;
+                            } else {
+                                size_t idx = static_cast<size_t>(j) * static_cast<size_t>(scene.width) +
+                                             static_cast<size_t>(i);
+                                output.albedo_pixels[idx] += albedo;
+                                output.normal_pixels[idx] += normal;
+                            }
+                        }
                     }
                     if (row_cancelled) break;
                     if (partial_enabled) {
@@ -623,6 +709,16 @@ inline RenderOutput render_scene(const Scene& scene,
                               row_pixels.end(),
                               output.pixels.begin() +
                                   static_cast<size_t>(j) * static_cast<size_t>(scene.width));
+                    if (options.auxiliary_buffers) {
+                        std::copy(row_albedo.begin(),
+                                  row_albedo.end(),
+                                  output.albedo_pixels.begin() +
+                                      static_cast<size_t>(j) * static_cast<size_t>(scene.width));
+                        std::copy(row_normal.begin(),
+                                  row_normal.end(),
+                                  output.normal_pixels.begin() +
+                                      static_cast<size_t>(j) * static_cast<size_t>(scene.width));
+                    }
                 }
                 int done = rows_done.fetch_add(1) + 1;
                 report_progress(done, scene.height, false);
@@ -665,9 +761,17 @@ inline RenderOutput render_scene(const Scene& scene,
                             double offset_y = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
                             double u = (i + offset_x) / std::max(1, scene.width - 1);
                             double v = (sample_row + offset_y) / std::max(1, scene.height - 1);
-                            Color sample = ray_color(
-                                scene.camera->get_ray(u, v), scene, scene.max_depth, options, infinity, false);
+                            Ray camera_ray = scene.camera->get_ray(u, v);
+                            Color sample = ray_color(camera_ray, scene, scene.max_depth, options, infinity, false);
                             col += clamp_radiance(sample, scene.firefly_clamp);
+                            if (options.auxiliary_buffers) {
+                                Color albedo, normal;
+                                trace_auxiliary_buffers(camera_ray, scene, scene.max_depth, albedo, normal);
+                                size_t idx = static_cast<size_t>(j) * static_cast<size_t>(scene.width) +
+                                             static_cast<size_t>(i);
+                                output.albedo_pixels[idx] += albedo;
+                                output.normal_pixels[idx] += normal;
+                            }
                         }
                         if (cancelled.load()) break;
                         output.pixels[static_cast<size_t>(j) * static_cast<size_t>(scene.width) +

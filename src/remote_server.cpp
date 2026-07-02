@@ -65,7 +65,11 @@ struct RenderJob {
     bool failed = false;
     std::string error;
     std::vector<unsigned char> result;
+    std::vector<unsigned char> albedo_result;
+    std::vector<unsigned char> normal_result;
     std::vector<unsigned char> partial_result;
+    std::vector<unsigned char> partial_albedo_result;
+    std::vector<unsigned char> partial_normal_result;
     unsigned long long partial_seq = 0;
     RenderProgressInfo render_status;
     bool has_render_status = false;
@@ -346,6 +350,7 @@ RenderOptions make_render_options(const std::map<std::string, std::string>& para
     options.direct_only = query_bool(params, "direct_only", false);
     options.direct_light_samples = std::max(1, query_int(params, "direct_light_samples", 1));
     options.emissive_light_samples = std::max(1, query_int(params, "emissive_light_samples", 1));
+    options.auxiliary_buffers = query_bool(params, "aux_buffers", false);
     options.schedule = query_render_schedule(params);
     options.partial_update_interval = query_int(params, "partial_update_interval",
                                                 query_int(params, "partial_update_rows", 0));
@@ -400,6 +405,61 @@ std::vector<unsigned char> render_scene_body(const std::string& body,
     RenderOutput output = render_scene(scene, options, callbacks);
     if (output.cancelled) throw std::runtime_error("render cancelled");
     return encode_rgba32f(output);
+}
+
+struct EncodedRenderResult {
+    std::vector<unsigned char> color;
+    std::vector<unsigned char> albedo;
+    std::vector<unsigned char> normal;
+};
+
+EncodedRenderResult render_scene_body_full(const std::string& body,
+                                           const std::map<std::string, std::string>& params,
+                                           const ServerArgs& args,
+                                           const std::function<void(double)>& on_progress,
+                                           const std::function<void(const RenderProgressInfo&)>& on_status,
+                                           const std::function<void(const RenderOutput&, double)>& on_partial,
+                                           const std::function<bool()>& should_cancel) {
+    Scene scene = load_scene_from_body(body);
+    apply_scene_overrides(scene, params);
+
+    int requested_threads = 0;
+    RenderOptions options = make_render_options(params, args, requested_threads);
+    std::cerr << "INFO remote render image=" << scene.width << "x" << scene.height
+              << " samples=" << scene.samples
+              << " depth=" << scene.max_depth
+              << " threads=" << resolve_thread_count(scene, options)
+              << " requested_threads=" << requested_threads
+              << " max_request_threads=" << args.max_request_threads
+              << " schedule=" << render_schedule_name(options.schedule)
+              << " sample_pass_batch=" << options.sample_pass_batch
+              << " direct_only=" << (options.direct_only ? "true" : "false")
+              << " direct_light_samples=" << options.direct_light_samples
+              << " emissive_light_samples=" << options.emissive_light_samples
+              << " aux_buffers=" << (options.auxiliary_buffers ? "true" : "false")
+              << " primitives=" << scene.primitive_count << "\n";
+
+    RenderCallbacks callbacks;
+    callbacks.progress = [&](double progress) {
+        double clamped = std::clamp(progress, 0.0, 1.0);
+        int pct = static_cast<int>(clamped * 100.0);
+        std::cerr << "PROGRESS " << pct << "%\n" << std::flush;
+        if (on_progress) on_progress(clamped);
+    };
+    callbacks.status = on_status;
+    callbacks.partial = on_partial;
+    callbacks.should_cancel = should_cancel;
+
+    RenderOutput output = render_scene(scene, options, callbacks);
+    if (output.cancelled) throw std::runtime_error("render cancelled");
+
+    EncodedRenderResult result;
+    result.color = encode_rgba32f(output);
+    if (options.auxiliary_buffers) {
+        result.albedo = encode_albedo_rgba32f(output);
+        result.normal = encode_normal_rgba32f(output);
+    }
+    return result;
 }
 
 std::vector<unsigned char> render_request(const HttpRequest& request, const ServerArgs& args) {
@@ -469,7 +529,7 @@ void run_job(std::shared_ptr<RenderJob> job,
     }
 
     try {
-        std::vector<unsigned char> result = render_scene_body(
+        EncodedRenderResult result = render_scene_body_full(
             body,
             params,
             args,
@@ -486,8 +546,16 @@ void run_job(std::shared_ptr<RenderJob> job,
             [job](const RenderOutput& partial, double progress) {
                 try {
                     std::vector<unsigned char> bytes = encode_rgba32f(partial);
+                    std::vector<unsigned char> albedo;
+                    std::vector<unsigned char> normal;
+                    if (!partial.albedo_pixels.empty() && !partial.normal_pixels.empty()) {
+                        albedo = encode_albedo_rgba32f(partial);
+                        normal = encode_normal_rgba32f(partial);
+                    }
                     std::lock_guard<std::mutex> lock(job->mutex);
                     job->partial_result = std::move(bytes);
+                    job->partial_albedo_result = std::move(albedo);
+                    job->partial_normal_result = std::move(normal);
                     job->partial_seq += 1;
                     job->progress = std::max(job->progress, std::clamp(progress, 0.0, 1.0));
                 } catch (const std::exception& e) {
@@ -499,7 +567,9 @@ void run_job(std::shared_ptr<RenderJob> job,
             });
 
         std::lock_guard<std::mutex> lock(job->mutex);
-        job->result = std::move(result);
+        job->result = std::move(result.color);
+        job->albedo_result = std::move(result.albedo);
+        job->normal_result = std::move(result.normal);
         job->progress = 1.0;
         job->done = true;
     } catch (const std::exception& e) {
@@ -629,6 +699,44 @@ void handle_client(int client_fd, const ServerArgs& args) {
                                   text_body(job_status_json(job)));
                 }
             }
+        } else if (request.method == "GET" &&
+                   (!job_id_from_path(request.path, "/albedo").empty() ||
+                    !job_id_from_path(request.path, "/normal").empty())) {
+            bool want_albedo = !job_id_from_path(request.path, "/albedo").empty();
+            std::string id = want_albedo
+                ? job_id_from_path(request.path, "/albedo")
+                : job_id_from_path(request.path, "/normal");
+            std::shared_ptr<RenderJob> job = find_job(id);
+            if (!job) {
+                send_response(client_fd, 404, "Not Found", "text/plain", text_body("job not found\n"));
+            } else {
+                std::vector<unsigned char> aux;
+                std::string status;
+                std::string error;
+                {
+                    std::lock_guard<std::mutex> lock(job->mutex);
+                    if (job->done) aux = want_albedo ? job->albedo_result : job->normal_result;
+                    else if (job->failed) error = job->error;
+                    else if (job->cancelled) status = "cancelled";
+                    else status = "rendering";
+                }
+
+                if (!aux.empty()) {
+                    send_response(client_fd, 200, "OK", "application/octet-stream", aux);
+                } else if (!error.empty()) {
+                    send_response(client_fd, 500, "Internal Server Error", "text/plain",
+                                  text_body("error: " + error + "\n"));
+                } else if (status == "cancelled") {
+                    send_response(client_fd, 409, "Conflict", "text/plain",
+                                  text_body("job cancelled\n"));
+                } else if (status == "rendering") {
+                    send_response(client_fd, 202, "Accepted", "application/json",
+                                  text_body(job_status_json(job)));
+                } else {
+                    send_response(client_fd, 404, "Not Found", "text/plain",
+                                  text_body("auxiliary buffer not available\n"));
+                }
+            }
         } else if (request.method == "GET" && !job_id_from_path(request.path, "/partial").empty()) {
             std::string id = job_id_from_path(request.path, "/partial");
             std::shared_ptr<RenderJob> job = find_job(id);
@@ -641,6 +749,40 @@ void handle_client(int client_fd, const ServerArgs& args) {
                 {
                     std::lock_guard<std::mutex> lock(job->mutex);
                     partial = job->partial_result;
+                    error = job->error;
+                    cancelled = job->cancelled;
+                }
+
+                if (!partial.empty()) {
+                    send_response(client_fd, 200, "OK", "application/octet-stream", partial);
+                } else if (!error.empty()) {
+                    send_response(client_fd, 500, "Internal Server Error", "text/plain",
+                                  text_body("error: " + error + "\n"));
+                } else if (cancelled) {
+                    send_response(client_fd, 409, "Conflict", "text/plain",
+                                  text_body("job cancelled\n"));
+                } else {
+                    send_response(client_fd, 202, "Accepted", "application/json",
+                                  text_body(job_status_json(job)));
+                }
+            }
+        } else if (request.method == "GET" &&
+                   (!job_id_from_path(request.path, "/partial-albedo").empty() ||
+                    !job_id_from_path(request.path, "/partial-normal").empty())) {
+            bool want_albedo = !job_id_from_path(request.path, "/partial-albedo").empty();
+            std::string id = want_albedo
+                ? job_id_from_path(request.path, "/partial-albedo")
+                : job_id_from_path(request.path, "/partial-normal");
+            std::shared_ptr<RenderJob> job = find_job(id);
+            if (!job) {
+                send_response(client_fd, 404, "Not Found", "text/plain", text_body("job not found\n"));
+            } else {
+                std::vector<unsigned char> partial;
+                std::string error;
+                bool cancelled = false;
+                {
+                    std::lock_guard<std::mutex> lock(job->mutex);
+                    partial = want_albedo ? job->partial_albedo_result : job->partial_normal_result;
                     error = job->error;
                     cancelled = job->cancelled;
                 }
