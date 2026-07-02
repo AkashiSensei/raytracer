@@ -429,6 +429,46 @@ void test_render_scene_sample_pass_schedule_reports_accumulated_samples() {
     check(last_partial_samples == scene.samples, "final sample-pass partial should use final sample count");
 }
 
+void test_seeded_render_is_thread_count_independent() {
+    {
+        std::ofstream out("/tmp/rt_seed_thread_independent.json");
+        out << "{"
+            << "\"image\":{\"width\":8,\"height\":6,\"samples\":4,\"max_depth\":4,\"seed\":77},"
+            << "\"camera\":{\"lookfrom\":[0,1,4],\"lookat\":[0,0,-1],\"vup\":[0,1,0],\"vfov\":40},"
+            << "\"lighting\":{\"ambient\":[0,0,0]},"
+            << "\"objects\":["
+            << "{\"type\":\"sphere\",\"center\":[0,-100.5,-1],\"radius\":100,"
+            << "\"material\":{\"type\":\"lambertian\",\"albedo\":[0.8,0.8,0.8]}},"
+            << "{\"type\":\"sphere\",\"center\":[0,0,-1],\"radius\":0.5,"
+            << "\"material\":{\"type\":\"lambertian\",\"albedo\":[0.5,0.6,0.7]}},"
+            << "{\"type\":\"sphere\",\"center\":[0,1.5,-1],\"radius\":0.25,"
+            << "\"material\":{\"type\":\"emissive\",\"emission\":[8,8,8]}}"
+            << "]"
+            << "}";
+    }
+
+    Scene single_thread_scene;
+    Scene multi_thread_scene;
+    load_scene("/tmp/rt_seed_thread_independent.json", single_thread_scene);
+    load_scene("/tmp/rt_seed_thread_independent.json", multi_thread_scene);
+
+    RenderOptions single_thread_options;
+    single_thread_options.threads = 1;
+    RenderOutput single_thread = render_scene(single_thread_scene, single_thread_options);
+
+    RenderOptions multi_thread_options;
+    multi_thread_options.threads = 4;
+    RenderOutput multi_thread = render_scene(multi_thread_scene, multi_thread_options);
+
+    check(single_thread.pixels.size() == multi_thread.pixels.size(),
+          "seeded render should produce comparable pixel buffers");
+    size_t count = std::min(single_thread.pixels.size(), multi_thread.pixels.size());
+    for (size_t i = 0; i < count; i++) {
+        check(near_vec(single_thread.pixels[i], multi_thread.pixels[i], 1e-12),
+              "seeded render should not depend on render thread count");
+    }
+}
+
 void test_extended_light_types_parse() {
     JsonValue rect;
     rect.type = JsonValue::Object;
@@ -1393,6 +1433,7 @@ int main() {
     test_environment_solid_and_gradient_backgrounds();
     test_render_scene_reports_partial_updates();
     test_render_scene_sample_pass_schedule_reports_accumulated_samples();
+    test_seeded_render_is_thread_count_independent();
     test_extended_light_types_parse();
     test_extended_light_sampling_outputs_radiance();
     test_analytic_area_light_visibility_for_camera_and_specular_rays();

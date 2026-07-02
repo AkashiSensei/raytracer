@@ -38,6 +38,12 @@ inline void set_random_seed(unsigned int seed) {
     if (state == 0) state = 0x9e3779b97f4a7c15ULL;
 }
 
+inline void set_thread_random_seed(uint64_t seed) {
+    uint64_t& state = random_state_storage();
+    state = splitmix64(seed);
+    if (state == 0) state = 0x9e3779b97f4a7c15ULL;
+}
+
 inline uint64_t random_u64() {
     uint64_t& state = random_state_storage();
     uint64_t x = state;

@@ -201,6 +201,17 @@ inline bool is_shadowed(const Hittable& world, const Ray& shadow_ray, double max
     return false;
 }
 
+inline uint64_t render_sample_seed(uint64_t base_seed, int x, int y, int sample_index) {
+    uint64_t h = base_seed ^ 0x6a09e667f3bcc909ULL;
+    h ^= (static_cast<uint64_t>(static_cast<uint32_t>(x)) + 0x9e3779b97f4a7c15ULL) +
+         (h << 6) + (h >> 2);
+    h ^= (static_cast<uint64_t>(static_cast<uint32_t>(y)) + 0xbf58476d1ce4e5b9ULL) +
+         (h << 6) + (h >> 2);
+    h ^= (static_cast<uint64_t>(static_cast<uint32_t>(sample_index)) + 0x94d049bb133111ebULL) +
+         (h << 6) + (h >> 2);
+    return h;
+}
+
 inline const EmissiveObject* sample_emissive_by_area(const Scene& scene,
                                                      double r,
                                                      double total_area) {
@@ -408,6 +419,9 @@ inline RenderOutput render_scene(const Scene& scene,
         ? std::max(1, options.partial_update_interval)
         : 0;
     bool partial_enabled = callbacks.partial && partial_interval > 0;
+    uint64_t render_seed = scene.has_seed
+        ? static_cast<uint64_t>(scene.seed)
+        : static_cast<uint64_t>(random_seed_storage());
 
     auto cancel_requested = [&]() {
         if (cancelled.load()) return true;
@@ -519,6 +533,7 @@ inline RenderOutput render_scene(const Scene& scene,
                             row_cancelled = true;
                             break;
                         }
+                        set_thread_random_seed(render_sample_seed(render_seed, i, sample_row, s));
                         double offset_x = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
                         double offset_y = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
                         double u = (i + offset_x) / std::max(1, scene.width - 1);
@@ -579,6 +594,8 @@ inline RenderOutput render_scene(const Scene& scene,
                         Color col(0, 0, 0);
                         for (int s = 0; s < samples_this_pass; s++) {
                             if ((s & 15) == 0 && cancel_requested()) break;
+                            int sample_index = sample_start + s;
+                            set_thread_random_seed(render_sample_seed(render_seed, i, sample_row, sample_index));
                             double offset_x = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
                             double offset_y = (options.direct_only && scene.samples == 1) ? 0.5 : random_double();
                             double u = (i + offset_x) / std::max(1, scene.width - 1);
