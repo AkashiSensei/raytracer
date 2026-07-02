@@ -9,8 +9,10 @@ bl_info = {
 }
 
 import array
+import base64
 import json
 import math
+import mimetypes
 import os
 import struct
 import subprocess
@@ -831,6 +833,64 @@ def export_ambient(settings):
     ]
 
 
+def mime_type_for_image_path(path):
+    mime, _ = mimetypes.guess_type(path)
+    if mime:
+        return mime
+    ext = Path(path).suffix.lower()
+    if ext in (".jpg", ".jpeg"):
+        return "image/jpeg"
+    if ext == ".png":
+        return "image/png"
+    if ext in (".ppm", ".pnm"):
+        return "image/x-portable-pixmap"
+    return "application/octet-stream"
+
+
+def embed_image_texture_node(node, cache):
+    if not isinstance(node, dict):
+        return node
+    if node.get("type") != "image":
+        return node
+    if "data_base64" in node:
+        return node
+
+    path = node.get("path") or node.get("file") or node.get("texture")
+    if not path:
+        return node
+    if not os.path.isfile(path):
+        raise RuntimeError("Texture image not found for remote render: " + str(path))
+
+    if path not in cache:
+        with open(path, "rb") as image_file:
+            cache[path] = {
+                "mime_type": mime_type_for_image_path(path),
+                "data_base64": base64.b64encode(image_file.read()).decode("ascii"),
+            }
+
+    embedded = dict(node)
+    embedded.update(cache[path])
+    embedded.pop("path", None)
+    embedded.pop("file", None)
+    embedded.pop("texture", None)
+    return embedded
+
+
+def embed_remote_texture_assets(package):
+    cache = {}
+
+    def walk(value):
+        if isinstance(value, dict):
+            if value.get("type") == "image":
+                return embed_image_texture_node(value, cache)
+            return {key: walk(child) for key, child in value.items()}
+        if isinstance(value, list):
+            return [walk(child) for child in value]
+        return value
+
+    return walk(package)
+
+
 def export_scene_package(scene, depsgraph, settings):
     scale = scene.render.resolution_percentage / 100.0
     width = max(1, int(scene.render.resolution_x * scale))
@@ -1069,6 +1129,10 @@ class RemoteHttpRenderer(RendererClient):
             pass
 
     def render(self, package, engine, settings, debug_cache=None):
+        package = embed_remote_texture_assets(package)
+        if debug_cache is not None:
+            write_debug_json(debug_cache, "scene.remote.json", package)
+
         deadline = time.monotonic() + max(1, int(settings.remote_timeout))
         render_params = {
             "threads": max(1, int(settings.threads)),

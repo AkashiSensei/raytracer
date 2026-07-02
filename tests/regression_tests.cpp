@@ -902,6 +902,16 @@ void test_checker_texture_json_scale_and_offset() {
           "PBR albedo should accept a checker texture object");
 }
 
+void test_image_texture_json_accepts_inline_base64_payload() {
+    JsonValue image = parse_json(
+        "{\"type\":\"image\",\"mime_type\":\"image/png\","
+        "\"data_base64\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==\"}");
+    auto tex = parse_texture_json(image, std::filesystem::current_path());
+    Color c = tex->value(0.0, 0.0, Point3());
+    check(finite_vec(c) && c.x >= 0.0 && c.x <= 1.0 && c.y >= 0.0 && c.y <= 1.0 && c.z >= 0.0 && c.z <= 1.0,
+          "image texture JSON with data_base64 should decode and sample a finite color");
+}
+
 void test_image_texture_json_accepts_uv_mapping_fields() {
     std::string checker_path = (std::filesystem::current_path() / "textures/checkerboard.png").string();
     JsonValue image = parse_json(
@@ -1399,6 +1409,7 @@ int main() {
     test_material_alpha_mask_interface();
     test_transformed_texture_applies_uv_scale_offset();
     test_checker_texture_json_scale_and_offset();
+    test_image_texture_json_accepts_inline_base64_payload();
     test_image_texture_json_accepts_uv_mapping_fields();
     test_image_texture_linear_interpolation();
     test_image_texture_srgb_decode();

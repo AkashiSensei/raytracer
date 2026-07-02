@@ -126,6 +126,34 @@ inline std::string resolve_asset_path(const std::filesystem::path& base_dir,
     return path.lexically_normal().string();
 }
 
+inline std::vector<unsigned char> decode_base64(const std::string& input) {
+    auto decode_char = [](unsigned char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '+') return 62;
+        if (c == '/') return 63;
+        return -1;
+    };
+
+    std::vector<unsigned char> out;
+    int val = 0;
+    int valb = -8;
+    for (unsigned char c : input) {
+        if (c == '=') break;
+        if (std::isspace(c)) continue;
+        int d = decode_char(c);
+        if (d < 0) continue;
+        val = (val << 6) + d;
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<unsigned char>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
 inline Mat4 parse_transform(const JsonValue& obj) {
     if (obj.has("transform")) {
         const JsonValue& t = obj.at("transform");
@@ -281,12 +309,25 @@ inline std::shared_ptr<Texture> parse_texture_json(const JsonValue& texture,
         if (texture.has("distortion")) noise->distortion = texture.at("distortion").numVal;
         result = noise;
     } else if (type == "image" || type == "texture") {
-        std::string path;
-        if (texture.has("path")) path = texture.at("path").strVal;
-        else if (texture.has("file")) path = texture.at("file").strVal;
-        else if (texture.has("texture")) path = texture.at("texture").strVal;
-        if (path.empty()) return make_solid_texture(fallback);
-        auto image = std::make_shared<ImageTexture>(resolve_asset_path(base_dir, path));
+        std::shared_ptr<ImageTexture> image;
+        if (texture.has("data_base64")) {
+            std::string mime = texture.has("mime_type") ? texture.at("mime_type").strVal : "image/png";
+            std::vector<unsigned char> encoded = decode_base64(texture.at("data_base64").strVal);
+            if (encoded.empty()) {
+                throw std::runtime_error("image texture data_base64 is empty or invalid");
+            }
+            image = std::make_shared<ImageTexture>(encoded, mime);
+        } else {
+            std::string path;
+            if (texture.has("path")) path = texture.at("path").strVal;
+            else if (texture.has("file")) path = texture.at("file").strVal;
+            else if (texture.has("texture")) path = texture.at("texture").strVal;
+            if (path.empty()) {
+                throw std::runtime_error(
+                    "image texture requires path or data_base64; rebuild raytracer_server if using remote embedded textures");
+            }
+            image = std::make_shared<ImageTexture>(resolve_asset_path(base_dir, path));
+        }
         if (texture.has("interpolation")) {
             std::string interpolation = lower_ascii(texture.at("interpolation").strVal);
             if (interpolation == "linear" || interpolation == "smart" || interpolation == "cubic") {
