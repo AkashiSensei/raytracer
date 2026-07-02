@@ -344,6 +344,8 @@ RenderOptions make_render_options(const std::map<std::string, std::string>& para
     requested_threads = query_int(params, "threads", args.default_threads);
     options.threads = apply_thread_limit(requested_threads, args);
     options.direct_only = query_bool(params, "direct_only", false);
+    options.direct_light_samples = std::max(1, query_int(params, "direct_light_samples", 1));
+    options.emissive_light_samples = std::max(1, query_int(params, "emissive_light_samples", 1));
     options.schedule = query_render_schedule(params);
     options.partial_update_interval = query_int(params, "partial_update_interval",
                                                 query_int(params, "partial_update_rows", 0));
@@ -380,6 +382,8 @@ std::vector<unsigned char> render_scene_body(const std::string& body,
               << " schedule=" << render_schedule_name(options.schedule)
               << " sample_pass_batch=" << options.sample_pass_batch
               << " direct_only=" << (options.direct_only ? "true" : "false")
+              << " direct_light_samples=" << options.direct_light_samples
+              << " emissive_light_samples=" << options.emissive_light_samples
               << " primitives=" << scene.primitive_count << "\n";
 
     RenderCallbacks callbacks;

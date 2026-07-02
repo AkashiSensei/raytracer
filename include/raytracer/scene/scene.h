@@ -895,6 +895,7 @@ inline LightSample sample_scene_light(const Light& light,
         double cos_light = std::max(0.0, std::fabs(dot(normal, -s.direction)));
         if (facing <= 0.0 || cos_light <= 0.0) return LightSample{};
         attenuation *= std::max(light.area(), 1e-8) * cos_light;
+        s.pdf = dist2 / (cos_light * std::max(light.area(), 1e-8));
         s.is_delta = false;
     } else if (light.type == LightType::Disk) {
         Vec3 n = safe_normalized(light.direction, Vec3(0, -1, 0));
@@ -902,6 +903,7 @@ inline LightSample sample_scene_light(const Light& light,
         double facing = dot(safe_normalized(light.direction, -n), -s.direction);
         if (facing <= 0.0 || cos_light <= 0.0) return LightSample{};
         attenuation *= std::max(light.area(), 1e-8) * cos_light;
+        s.pdf = dist2 / (cos_light * std::max(light.area(), 1e-8));
         s.is_delta = false;
     }
 

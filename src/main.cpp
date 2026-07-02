@@ -25,6 +25,8 @@ void print_usage(const char* prog) {
               << "  --tone-map <mode>  tone mapping: aces, reinhard, none\n"
               << "  --seed <n>         deterministic random seed (default: random_device)\n"
               << "  --firefly-clamp <n> clamp per-sample radiance peak before accumulation\n"
+              << "  --direct-light-samples <n> samples per analytic area light hit point (default: 1)\n"
+              << "  --emissive-light-samples <n> samples per emissive object direct-light estimate (default: 1)\n"
               << "  --stats            print load/render timing and scene statistics\n"
               << "  --stats-format <m> stats output format: text or json (default: text)\n"
               << "  --direct-only      disable recursive random bounces, use direct light + shadows only\n"
@@ -68,6 +70,18 @@ int main(int argc, char* argv[]) {
             seed_override = std::stoll(argv[++i]);
         } else if (arg == "--firefly-clamp" && i + 1 < argc) {
             firefly_clamp_override = std::stod(argv[++i]);
+        } else if (arg == "--direct-light-samples" && i + 1 < argc) {
+            render_options.direct_light_samples = std::stoi(argv[++i]);
+            if (render_options.direct_light_samples <= 0) {
+                std::cerr << "--direct-light-samples must be greater than 0\n";
+                return 1;
+            }
+        } else if (arg == "--emissive-light-samples" && i + 1 < argc) {
+            render_options.emissive_light_samples = std::stoi(argv[++i]);
+            if (render_options.emissive_light_samples <= 0) {
+                std::cerr << "--emissive-light-samples must be greater than 0\n";
+                return 1;
+            }
         } else if (arg == "--stats") {
             render_options.stats = true;
         } else if (arg == "--stats-format" && i + 1 < argc) {
@@ -135,6 +149,8 @@ int main(int argc, char* argv[]) {
               << ", samples=" << scene.samples
               << ", depth=" << scene.max_depth
               << ", mode=" << (render_options.direct_only ? "direct-only" : "path-tracing")
+              << ", direct_light_samples=" << render_options.direct_light_samples
+              << ", emissive_light_samples=" << render_options.emissive_light_samples
               << ", threads=" << thread_count << "\n"
               << "Primitives: " << scene.primitive_count << "\n";
 
@@ -172,6 +188,8 @@ int main(int argc, char* argv[]) {
                       << "\"samples\":" << scene.samples << ","
                       << "\"max_depth\":" << scene.max_depth << ","
                       << "\"threads\":" << thread_count << ","
+                      << "\"direct_light_samples\":" << render_options.direct_light_samples << ","
+                      << "\"emissive_light_samples\":" << render_options.emissive_light_samples << ","
                       << "\"primitives\":" << scene.primitive_count << ","
                       << "\"load_ms\":" << load_ms << ","
                       << "\"render_ms\":" << render_ms << ","
@@ -183,6 +201,8 @@ int main(int argc, char* argv[]) {
                       << "  load_ms=" << load_ms << "\n"
                       << "  render_ms=" << render_ms << "\n"
                       << "  total_ms=" << total_ms << "\n"
+                      << "  direct_light_samples=" << render_options.direct_light_samples << "\n"
+                      << "  emissive_light_samples=" << render_options.emissive_light_samples << "\n"
                       << "  emissive_area=" << scene.emissive_total_area << "\n";
         }
     }

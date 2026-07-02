@@ -35,6 +35,8 @@ void print_usage(const char* prog) {
               << "  --samples <n>        samples per pixel override\n"
               << "  --max-depth <n>      ray recursion depth override\n"
               << "  --threads <n>        render worker threads\n"
+              << "  --direct-light-samples <n> analytic area light samples per shading point\n"
+              << "  --emissive-light-samples <n> emissive object samples per shading point\n"
               << "  --render-schedule <rows|sample-passes> render ordering, default rows\n"
               << "  --partial-dir <path> write progressive RGBA32F preview snapshots\n"
               << "  --partial-update-interval <n> rows or sample passes between preview snapshots\n"
@@ -77,6 +79,18 @@ bool parse_args(int argc, char* argv[], BridgeArgs& args) {
             args.render_options.threads = std::stoi(argv[++i]);
             if (args.render_options.threads <= 0) {
                 std::cerr << "--threads must be greater than 0\n";
+                return false;
+            }
+        } else if (arg == "--direct-light-samples" && i + 1 < argc) {
+            args.render_options.direct_light_samples = std::stoi(argv[++i]);
+            if (args.render_options.direct_light_samples <= 0) {
+                std::cerr << "--direct-light-samples must be greater than 0\n";
+                return false;
+            }
+        } else if (arg == "--emissive-light-samples" && i + 1 < argc) {
+            args.render_options.emissive_light_samples = std::stoi(argv[++i]);
+            if (args.render_options.emissive_light_samples <= 0) {
+                std::cerr << "--emissive-light-samples must be greater than 0\n";
                 return false;
             }
         } else if (arg == "--direct-only") {
@@ -155,6 +169,8 @@ int main(int argc, char* argv[]) {
               << " lights=" << scene.lights.size()
               << " schedule=" << render_schedule_name(args.render_options.schedule)
               << " sample_pass_batch=" << args.render_options.sample_pass_batch
+              << " direct_light_samples=" << args.render_options.direct_light_samples
+              << " emissive_light_samples=" << args.render_options.emissive_light_samples
               << " ambient=(" << scene.ambient_light.x << ","
               << scene.ambient_light.y << "," << scene.ambient_light.z << ")"
               << " environment=" << environment_type

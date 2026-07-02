@@ -30,6 +30,8 @@ struct RenderOptions {
     int threads = 0;
     int partial_update_interval = 0;
     int sample_pass_batch = 16;
+    int direct_light_samples = 1;
+    int emissive_light_samples = 1;
     RenderSchedule schedule = RenderSchedule::Rows;
 };
 
@@ -74,6 +76,8 @@ enum class RayPathType {
 struct VisibleLightHit {
     double t = infinity;
     Color emission = Color(0, 0, 0);
+    double pdf = 0;
+    bool is_delta = true;
 };
 
 inline bool light_visible_to_path(const Light& light, RayPathType path_type) {
@@ -148,6 +152,28 @@ inline bool hit_sphere_light(const Light& light, const Ray& ray, double t_min, d
     return true;
 }
 
+inline double analytic_light_pdf(const Light& light, const Point3& from, const Point3& light_point) {
+    double area = light.area();
+    if (area <= 0.0) return 0.0;
+
+    Vec3 to_light = light_point - from;
+    double dist2 = to_light.length_squared();
+    if (dist2 <= 1e-12) return 0.0;
+    Vec3 light_dir = to_light / std::sqrt(dist2);
+
+    double cos_light = 0.0;
+    if (light.type == LightType::Rect) {
+        Vec3 normal = safe_normalized(cross(light.u, light.v), -light.direction);
+        cos_light = std::fabs(dot(normal, -light_dir));
+    } else if (light.type == LightType::Disk) {
+        Vec3 normal = safe_normalized(light.direction, Vec3(0, -1, 0));
+        cos_light = dot(normal, -light_dir);
+    }
+
+    if (cos_light <= 1e-8) return 0.0;
+    return dist2 / (cos_light * area);
+}
+
 inline bool hit_visible_analytic_light(const Scene& scene,
                                        const Ray& ray,
                                        RayPathType path_type,
@@ -172,6 +198,10 @@ inline bool hit_visible_analytic_light(const Scene& scene,
         closest = t;
         hit.t = t;
         hit.emission = light.color * light.intensity;
+        hit.is_delta = light.type == LightType::Point ||
+                       light.type == LightType::Directional ||
+                       light.type == LightType::Spot;
+        hit.pdf = hit.is_delta ? 0.0 : analytic_light_pdf(light, ray.origin, ray.at(t));
         found = true;
     }
     return found;
@@ -225,33 +255,53 @@ inline const EmissiveObject* sample_emissive_by_area(const Scene& scene,
     return scene.emissive_objects.empty() ? nullptr : &scene.emissive_objects.back();
 }
 
-inline Color direct_delta_lights(const Ray& r_in, const HitRecord& rec, const Scene& scene) {
+inline double mis_balance_weight(double sample_count, double this_pdf, double other_pdf) {
+    if (this_pdf <= 0.0) return 1.0;
+    double weighted_pdf = std::max(1.0, sample_count) * this_pdf;
+    double denom = weighted_pdf + std::max(0.0, other_pdf);
+    return denom > 0.0 ? weighted_pdf / denom : 1.0;
+}
+
+inline Color direct_delta_lights(const Ray& r_in,
+                                 const HitRecord& rec,
+                                 const Scene& scene,
+                                 const RenderOptions& options) {
     Color base = rec.material ? rec.material->base_color(rec) : Color(0.8, 0.8, 0.8);
     Color result = base * scene.ambient_light;
 
     for (const Light& light : scene.lights) {
-        double r1 = 0.5;
-        double r2 = 0.5;
-        if (light.type == LightType::Sphere || light.type == LightType::Rect ||
-            light.type == LightType::Disk) {
-            r1 = random_double();
-            r2 = random_double();
+        bool area_light = light.type == LightType::Sphere ||
+                          light.type == LightType::Rect ||
+                          light.type == LightType::Disk;
+        int sample_count = area_light ? std::max(1, options.direct_light_samples) : 1;
+        Color light_sum(0, 0, 0);
+
+        for (int i = 0; i < sample_count; i++) {
+            double r1 = area_light ? random_double() : 0.5;
+            double r2 = area_light ? random_double() : 0.5;
+
+            LightSample sample = sample_scene_light(light, rec.p, r1, r2);
+            if (sample.radiance.length_squared() <= 0) continue;
+
+            Vec3 light_dir = sample.direction;
+            double max_t = std::isfinite(sample.distance) ? sample.distance - 0.001 : infinity;
+            double n_dot_l = dot(rec.normal, light_dir);
+            if (n_dot_l <= 0) continue;
+
+            Ray shadow_ray(rec.p + 0.001 * rec.normal, light_dir);
+            if (is_shadowed(*scene.world, shadow_ray, max_t)) continue;
+
+            Ray light_ray(rec.p, light_dir);
+            Color brdf = rec.material ? rec.material->f(r_in, light_ray, rec) : base / pi;
+            double weight = 1.0;
+            if (!sample.is_delta && light.visible_diffuse && sample.pdf > 0.0) {
+                double brdf_pdf = rec.material ? rec.material->pdf(r_in, light_ray, rec) : 0.0;
+                weight = mis_balance_weight(sample_count, sample.pdf, brdf_pdf);
+            }
+            light_sum += brdf * sample.radiance * n_dot_l * weight;
         }
 
-        LightSample sample = sample_scene_light(light, rec.p, r1, r2);
-        if (sample.radiance.length_squared() <= 0) continue;
-
-        Vec3 light_dir = sample.direction;
-        double max_t = std::isfinite(sample.distance) ? sample.distance - 0.001 : infinity;
-        double n_dot_l = dot(rec.normal, light_dir);
-        if (n_dot_l <= 0) continue;
-
-        Ray shadow_ray(rec.p + 0.001 * rec.normal, light_dir);
-        if (is_shadowed(*scene.world, shadow_ray, max_t)) continue;
-
-        Ray light_ray(rec.p, light_dir);
-        Color brdf = rec.material ? rec.material->f(r_in, light_ray, rec) : base / pi;
-        result += brdf * sample.radiance * n_dot_l;
+        result += light_sum / sample_count;
     }
 
     return result;
@@ -269,6 +319,15 @@ inline Color ray_color(const Ray& r, const Scene& scene, int depth,
     double world_t = hit_world ? rec.t : infinity;
     VisibleLightHit light_hit;
     if (hit_visible_analytic_light(scene, r, path_type, world_t, light_hit)) {
+        if (path_type == RayPathType::Diffuse &&
+            prev_brdf &&
+            prev_pdf > 0.0 &&
+            !light_hit.is_delta &&
+            light_hit.pdf > 0.0) {
+            int sample_count = std::max(1, options.direct_light_samples);
+            double w_brdf = prev_pdf / (prev_pdf + sample_count * light_hit.pdf);
+            return light_hit.emission * w_brdf;
+        }
         return light_hit.emission;
     }
 
@@ -279,6 +338,7 @@ inline Color ray_color(const Ray& r, const Scene& scene, int depth,
     if (rec.material && rec.material->is_emissive()) {
         Color emitted = rec.material->emitted(rec);
         if (prev_brdf && prev_pdf > 0 && !scene.emissive_objects.empty()) {
+            int sample_count = std::max(1, options.emissive_light_samples);
             double total_area = scene.emissive_total_area;
             double pdf_light = 0;
             if (total_area > 0) {
@@ -286,7 +346,7 @@ inline Color ray_color(const Ray& r, const Scene& scene, int depth,
                 double cos_light = dot(rec.normal, -r.direction.normalized());
                 if (cos_light > 0) pdf_light = dist2 / (cos_light * total_area);
             }
-            double w_brdf = prev_pdf / (prev_pdf + pdf_light);
+            double w_brdf = prev_pdf / (prev_pdf + sample_count * pdf_light);
             return emitted * w_brdf;
         }
         return emitted;
@@ -336,37 +396,42 @@ inline Color ray_color(const Ray& r, const Scene& scene, int depth,
         return emission + attenuation * child;
     }
 
-    Color direct = direct_delta_lights(r, rec, scene);
+    Color direct = direct_delta_lights(r, rec, scene, options);
 
     if (!scene.emissive_objects.empty()) {
+        int sample_count = std::max(1, options.emissive_light_samples);
         double total_area = scene.emissive_total_area;
-        const EmissiveObject* eo = sample_emissive_by_area(scene, random_double(), total_area);
-        Vec3 light_normal;
-        Point3 light_point = eo
-            ? eo->geometry->sample_point(random_double(), random_double(), &light_normal)
-            : Point3();
+        Color emissive_sum(0, 0, 0);
+        for (int i = 0; i < sample_count; i++) {
+            const EmissiveObject* eo = sample_emissive_by_area(scene, random_double(), total_area);
+            Vec3 light_normal;
+            Point3 light_point = eo
+                ? eo->geometry->sample_point(random_double(), random_double(), &light_normal)
+                : Point3();
 
-        Vec3 to_light = light_point - rec.p;
-        double dist2 = to_light.length_squared();
-        if (eo && total_area > 0 && dist2 > 1e-8) {
-            double dist = std::sqrt(dist2);
-            Vec3 light_dir = to_light / dist;
-            double n_dot_l = dot(rec.normal, light_dir);
-            if (n_dot_l > 0) {
-                double cos_light = dot(light_normal, -light_dir);
-                if (cos_light > 0) {
-                    Ray shadow_ray(rec.p + 0.001 * rec.normal, light_dir);
-                    if (!is_shadowed(*scene.world, shadow_ray, dist - 0.001)) {
-                        double pdf_light = (dist2 / cos_light) / total_area;
-                        Ray light_ray(rec.p, light_dir);
-                        Color f_val = rec.material ? rec.material->f(r, light_ray, rec) : Color(0, 0, 0);
-                        double brdf_pdf = rec.material ? rec.material->pdf(r, light_ray, rec) : 0;
-                        double w_light = pdf_light / (pdf_light + brdf_pdf);
-                        direct += eo->emission * f_val * n_dot_l * w_light / pdf_light;
+            Vec3 to_light = light_point - rec.p;
+            double dist2 = to_light.length_squared();
+            if (eo && total_area > 0 && dist2 > 1e-8) {
+                double dist = std::sqrt(dist2);
+                Vec3 light_dir = to_light / dist;
+                double n_dot_l = dot(rec.normal, light_dir);
+                if (n_dot_l > 0) {
+                    double cos_light = dot(light_normal, -light_dir);
+                    if (cos_light > 0) {
+                        Ray shadow_ray(rec.p + 0.001 * rec.normal, light_dir);
+                        if (!is_shadowed(*scene.world, shadow_ray, dist - 0.001)) {
+                            double pdf_light = (dist2 / cos_light) / total_area;
+                            Ray light_ray(rec.p, light_dir);
+                            Color f_val = rec.material ? rec.material->f(r, light_ray, rec) : Color(0, 0, 0);
+                            double brdf_pdf = rec.material ? rec.material->pdf(r, light_ray, rec) : 0;
+                            double w_light = mis_balance_weight(sample_count, pdf_light, brdf_pdf);
+                            emissive_sum += eo->emission * f_val * n_dot_l * w_light / pdf_light;
+                        }
                     }
                 }
             }
         }
+        direct += emissive_sum / sample_count;
     }
 
     if (options.direct_only) return emission + direct;

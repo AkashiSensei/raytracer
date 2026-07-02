@@ -544,6 +544,8 @@ void test_extended_light_sampling_outputs_radiance() {
     LightSample rect_sample = sample_scene_light(rect_light, Point3(0, 0, 0), 0.5, 0.5);
     check(rect_sample.radiance.x > 0.0 && near(rect_sample.distance, 2.0),
           "rect light sampling should produce finite positive direct radiance");
+    check(near(rect_sample.pdf, 1.0),
+          "rect light sampling should report solid-angle PDF for MIS");
 
     JsonValue spot;
     spot.type = JsonValue::Object;
@@ -1365,6 +1367,8 @@ void test_disk_light_parses_and_samples() {
     LightSample s = sample_scene_light(light, Point3(0, 0, 0), 0.5, 0.5);
     check(!s.is_delta, "disk light should be a non-delta (area) light");
     check(s.radiance.length_squared() > 0, "disk light should emit positive radiance");
+    check(s.pdf > 0.0 && std::isfinite(s.pdf),
+          "disk light sampling should report a finite solid-angle PDF");
 }
 
 void test_dielectric_medium_tracking_applies_beer_lambert_on_exit() {

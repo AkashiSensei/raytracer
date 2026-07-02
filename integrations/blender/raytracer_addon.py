@@ -1005,6 +1005,8 @@ class LocalSubprocessRenderer(RendererClient):
             "--scene", str(scene_path),
             "--out-float", str(result_path),
             "--threads", str(max(1, int(settings.threads))),
+            "--direct-light-samples", str(max(1, int(settings.direct_light_samples))),
+            "--emissive-light-samples", str(max(1, int(settings.emissive_light_samples))),
             "--render-schedule", render_schedule_protocol(settings),
         ]
         if settings.progressive_preview:
@@ -1137,6 +1139,8 @@ class RemoteHttpRenderer(RendererClient):
         render_params = {
             "threads": max(1, int(settings.threads)),
             "direct_only": "1" if settings.direct_only else "0",
+            "direct_light_samples": max(1, int(settings.direct_light_samples)),
+            "emissive_light_samples": max(1, int(settings.emissive_light_samples)),
             "render_schedule": render_schedule_protocol(settings),
         }
         if settings.progressive_preview:
@@ -1312,6 +1316,20 @@ class RaytracerSettings(bpy.types.PropertyGroup):
     max_depth: IntProperty(name="最大深度", default=16, min=1, max=256)
     threads: IntProperty(name="线程数", default=8, min=1, max=128)
     direct_only: BoolProperty(name="仅直接光照", default=False)
+    direct_light_samples: IntProperty(
+        name="直接光采样",
+        default=2,
+        min=1,
+        max=16,
+        description="每个着色点对解析面积灯采样的次数；小灯更稳但会增加 shadow ray 开销",
+    )
+    emissive_light_samples: IntProperty(
+        name="发光体采样",
+        default=2,
+        min=1,
+        max=16,
+        description="每个着色点对发光物体表面采样的次数；小发光体更稳但会增加 shadow ray 开销",
+    )
     render_schedule: EnumProperty(
         name="采样调度",
         items=[
@@ -1466,6 +1484,8 @@ class RENDER_PT_raytracer_settings(bpy.types.Panel):
 
         lighting_box = layout.box()
         lighting_box.label(text="光照")
+        lighting_box.prop(settings, "direct_light_samples")
+        lighting_box.prop(settings, "emissive_light_samples")
         lighting_box.prop(settings, "light_intensity_scale")
         lighting_box.prop(settings, "area_light_camera_visible")
         lighting_box.prop(settings, "ambient_enabled")
